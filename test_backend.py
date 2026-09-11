@@ -3,7 +3,7 @@
 
     python3 test_backend.py
 """
-import base64, importlib.machinery, importlib.util, json, os, tempfile
+import importlib.machinery, importlib.util, json, os, tempfile
 
 spec = importlib.util.spec_from_loader(
     "gcal", importlib.machinery.SourceFileLoader(
@@ -154,8 +154,11 @@ try:
 except RuntimeError as exc:
     assert "KiB" in str(exc)
 _sys.stdin = _stdin
-# ...and the base64 argv form still works for the CLI
-assert gcal._payload(["save", base64.b64encode(b'{"a": 1}').decode()]) == {"a": 1}
+# ...and a payload offered as an argument is refused, never read
+try:
+    gcal._payload(["save", '{"a": 1}']); raise AssertionError("argv payload must be refused")
+except RuntimeError as exc:
+    assert "stdin" in str(exc)
 
 # -- the offline snapshot: absent reads as {}, kept only while the preference
 #    is on, and removed the moment it is switched off

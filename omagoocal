@@ -21,7 +21,6 @@ is checked to be ours and private before every read or write, and every
 network response and page walk has a ceiling.
 """
 
-import base64
 import json
 import os
 import re
@@ -697,14 +696,12 @@ def delete(args):
 # ----------------------------------------------------------------- dispatch
 
 def _payload(argv):
-    """The JSON document for save/delete/setall.
-
-    Normally one line on stdin, the way Omarchy's own network panel hands a
-    Wi-Fi secret to nmcli: event text and config never appear in argv, which
-    every local process can read. A base64 argument is still accepted so the
-    CLI stays scriptable."""
+    """The JSON document for save/delete/setall: one line on stdin, the way
+    Omarchy's own network panel hands a Wi-Fi secret to nmcli. Event text and
+    config never appear in argv, which every local process can read, so an
+    extra argument is refused rather than read."""
     if len(argv) > 1:
-        return json.loads(base64.b64decode(argv[1]))
+        raise RuntimeError("%s takes its payload on stdin, not as an argument" % argv[0])
     line = sys.stdin.readline(MAX_PAYLOAD_BYTES + 1)
     if len(line) > MAX_PAYLOAD_BYTES:
         raise RuntimeError("Payload over %d KiB" % (MAX_PAYLOAD_BYTES >> 10))
