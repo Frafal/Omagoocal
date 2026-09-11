@@ -67,6 +67,7 @@ DEFAULTS = {
     "hours12": False,
     "dayStartHour": 7,
     "refreshMinutes": 5,
+    "snapshot": True,       # keep the last sync on disk so opens are instant
 }
 
 
@@ -113,6 +114,13 @@ def _read(path, fallback):
         return json.loads(text)
     except (OSError, ValueError):
         return fallback
+
+
+def _remove(path):
+    try:
+        os.unlink(os.path.basename(path), dir_fd=_state_fd())
+    except FileNotFoundError:
+        pass
 
 
 def _write(path, data):
@@ -496,10 +504,18 @@ def main(argv):
             payload["calendars"] = calendar_list(fresh)
             payload["events"] = events(argv[1], argv[2], payload["calendars"], fresh)
             # Kept so the panel can paint the last known week the instant the
-            # shell starts, before this process has even been spawned.
-            _write(LAST_SYNC, {"timeMin": argv[1], "timeMax": argv[2],
-                               "payload": payload})
+            # shell starts. Event text on disk is a trade some people will not
+            # want, so it is a preference; off means nothing is kept.
+            if cfg.get("snapshot", True):
+                _write(LAST_SYNC, {"timeMin": argv[1], "timeMax": argv[2],
+                                   "payload": payload})
+            else:
+                _remove(LAST_SYNC)
         return payload
+    if cmd == "snapshot":
+        # Read through the same validated, no-follow, bounded path as every
+        # other state file, rather than by the panel opening the file itself.
+        return _read(LAST_SYNC, {})
     if cmd == "setall":
         # The panel owns the whole config while it is open, so it writes the
         # whole thing. Last write wins, which is what a settings page means.
@@ -508,6 +524,8 @@ def main(argv):
             raise RuntimeError("Config must be a JSON object")
         cfg.update(incoming)
         _write(CONFIG, cfg)
+        if not cfg.get("snapshot", True):
+            _remove(LAST_SYNC)
         return {"ok": True}
     if cmd in ("save", "delete"):
         args = _payload(argv)

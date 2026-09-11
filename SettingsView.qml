@@ -431,7 +431,9 @@ Flickable {
                         { value: 9, label: "09:00" }] },
             { key: "refreshMinutes", label: "Refresh every",
               options: [{ value: 1, label: "1 minute" }, { value: 5, label: "5 minutes" },
-                        { value: 15, label: "15 minutes" }, { value: 30, label: "30 minutes" }] }
+                        { value: 15, label: "15 minutes" }, { value: 30, label: "30 minutes" }] },
+            { key: "snapshot", label: "Keep last sync on disk (instant open)",
+              options: [{ value: true, label: "Yes" }, { value: false, label: "No — fetch every time" }] }
           ]
 
           Column {

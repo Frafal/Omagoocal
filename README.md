@@ -69,7 +69,9 @@ calls `/usr/bin/busctl`, `/usr/bin/notify-send`, `/usr/bin/xdg-open`,
 by absolute path. Every API response is capped at 8 MiB and every paginated
 listing at 20 pages / 5000 items.
 
-Calendar content is treated as untrusted: anyone who shares a calendar with
+No file is ever opened by the panel itself — the snapshot, like every state
+file, is read by the backend through the same validated, no-follow, bounded
+path. Calendar content is treated as untrusted: anyone who shares a calendar with
 you chooses the text in it. Every event field is rendered as plain text
 (never parsed as markup), notification text is escaped and passed after
 `--`, only `https://` links are ever handed to `xdg-open`, and event ids are
@@ -119,8 +121,12 @@ calendars to show, notification lead time, opening view, week start, 12/24
 hour clock, the hour the grid opens on, and refresh interval.
 
 Preferences live in `~/.local/state/omagoocal/config.json`, alongside a
-one-hour cache of calendar lists and the last sync result. Delete the folder
-to reset everything; accounts themselves live in GNOME Online Accounts.
+one-hour cache of calendar lists and, by default, the last sync result so
+the panel opens instantly after a shell restart. That snapshot holds event
+text on disk (`0600`, in a `0700` folder); **Keep last sync on disk** in
+settings turns it off and deletes it, after which every open fetches fresh.
+Delete the folder to reset everything; accounts themselves live in GNOME
+Online Accounts.
 
 ## Themes
 

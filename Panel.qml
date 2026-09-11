@@ -407,25 +407,31 @@ Panel {
 
   Component.onCompleted: {
     statusProc.running = true        // config before first paint, so the
-    checkDeps()                      // panel opens on the user's default view
+    snapshotProc.running = true      // panel opens on the user's default view
+    checkDeps()
   }
 
-  // Last sync, on disk. Painted before any process is spawned, so a shell
-  // restart shows last week's state instantly rather than an empty grid — and
-  // the bar has a next event to name from the first frame.
-  FileView {
-    path: String(Quickshell.env("HOME")) + "/.local/state/omagoocal/last-sync.json"
-    printErrors: false
-    onLoaded: {
-      if (root.everSynced) return
-      try {
-        var snap = JSON.parse(String(text() || "{}"))
-        // Only if the saved window still covers the one we are about to ask
-        // for; otherwise the fetch alone is the honest picture.
-        if (Model.parseStamp(snap.timeMin) <= root.rangeStart()
-            && Model.parseStamp(snap.timeMax) >= root.rangeEnd())
-          root.applySync(snap.payload, true)
-      } catch (e) { /* no snapshot yet, or a stale shape: the sync covers it */ }
+  // Last sync, on disk. Painted at startup so a shell restart shows last
+  // week's state at once rather than an empty grid, and the bar has a next
+  // event to name from the first frame. Read by the backend, not by QML: the
+  // backend opens state files no-follow, relative to a validated directory,
+  // with a size ceiling — the panel never opens a path itself.
+  Process {
+    id: snapshotProc
+    command: [root.backend, "snapshot"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (root.everSynced) return
+        try {
+          var snap = JSON.parse(String(text || "{}"))
+          // Only if the saved window still covers the one we are about to
+          // ask for; otherwise the fetch alone is the honest picture.
+          if (snap.payload && Model.parseStamp(snap.timeMin) <= root.rangeStart()
+              && Model.parseStamp(snap.timeMax) >= root.rangeEnd())
+            root.applySync(snap.payload, true)
+        } catch (e) { /* no snapshot yet, or a stale shape: the sync covers it */ }
+      }
     }
   }
 

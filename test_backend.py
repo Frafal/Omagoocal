@@ -112,6 +112,19 @@ _sys.stdin = _stdin
 # ...and the base64 argv form still works for the CLI
 assert gcal._payload(["save", base64.b64encode(b'{"a": 1}').decode()]) == {"a": 1}
 
+# -- the offline snapshot: absent reads as {}, kept only while the preference
+#    is on, and removed the moment it is switched off
+assert gcal.main(["snapshot"]) == {}, "no snapshot yet reads as empty"
+gcal._write(gcal.LAST_SYNC, {"timeMin": "a", "timeMax": "b", "payload": {"events": []}})
+assert gcal.main(["snapshot"])["timeMin"] == "a"
+_sys.stdin = io.StringIO(json.dumps({"snapshot": False}) + "\n")
+gcal.main(["setall"])
+assert not os.path.exists(gcal.LAST_SYNC), "turning the preference off must delete the snapshot"
+assert gcal.main(["snapshot"]) == {}
+_sys.stdin = io.StringIO(json.dumps({"snapshot": True}) + "\n")
+gcal.main(["setall"])
+_sys.stdin = _stdin
+
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",
                     "end": "2026-01-01T10:00:00-06:00", "location": ""})
