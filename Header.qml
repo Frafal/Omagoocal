@@ -158,6 +158,7 @@ Item {
     width: parent.width * 0.6
     visible: panel.error !== ""
     text: "⚠  " + panel.error
+    textFormat: Text.PlainText   // API error bodies are remote text too
     color: Color.urgent
     elide: Text.ElideRight
     font.family: panel.mono

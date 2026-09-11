@@ -229,9 +229,13 @@ Panel {
     else if (view === "settings" && !settingsPinned) view = cfg.defaultView || "week"
   }
 
+  // Payloads travel on stdin, not argv: argv is readable by every local
+  // process, and these carry event text and settings. Same pattern Omarchy's
+  // network panel uses for Wi-Fi secrets.
   function mutate(command, payload, onDone) {
     mutateProc.pending = onDone || null
-    mutateProc.command = [root.backend, command, Qt.btoa(JSON.stringify(payload))]
+    mutateProc.payload = JSON.stringify(payload)
+    mutateProc.command = [root.backend, command]
     mutateProc.running = true
   }
 
@@ -261,7 +265,8 @@ Panel {
   function persistConfig() {
     if (configProc.running) { configDirty = true; return }
     configDirty = false
-    configProc.command = [root.backend, "setall", Qt.btoa(JSON.stringify(cfg))]
+    configProc.payload = JSON.stringify(cfg)
+    configProc.command = [root.backend, "setall"]
     configProc.running = true
   }
 
@@ -370,11 +375,12 @@ Panel {
     for (var i = 0; i < due.length; i++) {
       var ev = due[i]
       fired[ev.id] = true
+      // "--" so a title beginning with "-" is text, not an option.
       Quickshell.execDetached(["/usr/bin/notify-send", "-a", "Calendar", "-u", "normal",
-        "-t", "12000", "-i", "office-calendar",
-        ev.title,
-        Model.relative(ev.startAt, now) + " · " + Model.rangeLabel(ev, hours12)
-          + (ev.location ? "\n" + ev.location : "")])
+        "-t", "12000", "-i", "office-calendar", "--",
+        Model.escapeMarkup(ev.title),
+        Model.escapeMarkup(Model.relative(ev.startAt, now) + " · " + Model.rangeLabel(ev, hours12)
+          + (ev.location ? "\n" + ev.location : ""))])
     }
   }
 
@@ -482,6 +488,9 @@ Panel {
   Process {
     id: mutateProc
     property var pending: null
+    property string payload: ""
+    stdinEnabled: true
+    onStarted: { write(payload + "\n"); payload = "" }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -498,6 +507,9 @@ Panel {
 
   Process {
     id: configProc
+    property string payload: ""
+    stdinEnabled: true
+    onStarted: { write(payload + "\n"); payload = "" }
     onExited: {
       if (root.configDirty) { root.persistConfig(); return }
       if (!root.refreshAfterConfig) return

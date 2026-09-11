@@ -3,7 +3,7 @@
 
     python3 test_backend.py
 """
-import importlib.machinery, importlib.util, json, os, tempfile
+import base64, importlib.machinery, importlib.util, json, os, tempfile
 
 spec = importlib.util.spec_from_loader(
     "gcal", importlib.machinery.SourceFileLoader(
@@ -78,6 +78,39 @@ try:
     raise AssertionError("aggregate item ceiling must raise")
 except RuntimeError as exc:
     assert "items" in str(exc)
+
+# -- ids from the API are quoted into the URL path, never concatenated raw
+seen = []
+gcal.api = lambda account, path, params=None, payload=None, method=None: seen.append((method, path)) or {}
+gcal._tokens["a@b.com"] = "t"
+gcal.save({"id": "evil/../other?sendUpdates=all", "account": "a@b.com", "calendarId": "c@x",
+           "title": "T", "start": "2026-01-01T09:00:00-06:00", "end": "2026-01-01T10:00:00-06:00"})
+gcal.delete({"id": "a/b?c", "account": "a@b.com", "calendarId": "c@x"})
+for method, path in seen:
+    assert "/../" not in path and "?" not in path, (method, path)
+    assert path.count("/") == 4, "id must be one path segment: " + path
+assert seen[0][0] == "PATCH" and "evil%2F..%2Fother%3FsendUpdates%3Dall" in seen[0][1]
+assert seen[1][0] == "DELETE" and path.endswith("a%2Fb%3Fc")
+gcal._tokens.clear()                     # leave no seeded token for the GOA test below
+
+# -- payloads arrive as one line on stdin; oversize or non-object is refused
+import io, sys as _sys
+_stdin = _sys.stdin
+_sys.stdin = io.StringIO(json.dumps({"notifyMinutes": 42}) + "\n")
+assert gcal.main(["setall"]) == {"ok": True} and gcal.load_config()["notifyMinutes"] == 42
+_sys.stdin = io.StringIO("[1,2,3]\n")
+try:
+    gcal.main(["setall"]); raise AssertionError("non-object config must be refused")
+except RuntimeError as exc:
+    assert "object" in str(exc)
+_sys.stdin = io.StringIO("x" * (gcal.MAX_PAYLOAD_BYTES + 10))
+try:
+    gcal._payload(["save"]); raise AssertionError("oversize payload must be refused")
+except RuntimeError as exc:
+    assert "KiB" in str(exc)
+_sys.stdin = _stdin
+# ...and the base64 argv form still works for the CLI
+assert gcal._payload(["save", base64.b64encode(b'{"a": 1}').decode()]) == {"a": 1}
 
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",

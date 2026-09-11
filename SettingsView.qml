@@ -231,6 +231,7 @@ Flickable {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               text: modelData
+              textFormat: Text.PlainText
               color: root.panel.ink
               font.family: root.panel.mono
               font.pixelSize: Style.font.bodySmall
@@ -299,6 +300,7 @@ Flickable {
             visible: root.panel.accounts.length > 1
             topPadding: Style.space(8)
             text: modelData
+            textFormat: Text.PlainText
             color: root.panel.faint
             font.family: root.panel.mono
             font.pixelSize: Style.font.caption
@@ -355,6 +357,7 @@ Flickable {
                 anchors.rightMargin: Style.space(10)
                 anchors.verticalCenter: parent.verticalCenter
                 text: calRow.modelData.name
+                textFormat: Text.PlainText
                 color: calRow.on ? root.panel.ink : root.panel.faint
                 elide: Text.ElideRight
                 font.family: root.panel.mono

@@ -69,6 +69,12 @@ calls `/usr/bin/busctl`, `/usr/bin/notify-send`, `/usr/bin/xdg-open`,
 by absolute path. Every API response is capped at 8 MiB and every paginated
 listing at 20 pages / 5000 items.
 
+Calendar content is treated as untrusted: anyone who shares a calendar with
+you chooses the text in it. Every event field is rendered as plain text
+(never parsed as markup), notification text is escaped and passed after
+`--`, only `https://` links are ever handed to `xdg-open`, and event ids are
+URL-quoted before they touch a request path.
+
 ## Remove
 
 ```bash

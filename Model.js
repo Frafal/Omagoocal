@@ -335,6 +335,20 @@ function dueNotifications(events, now, leadMinutes, fired) {
   return due
 }
 
+// Event text is somebody else's text: anyone who shares a calendar or sends
+// an invite chooses it. Most notification daemons render the body as Pango
+// markup, so it is escaped rather than trusted.
+function escapeMarkup(text) {
+  return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+// Only a web link is handed to xdg-open. A file:// or custom-scheme value in
+// an event's link field would otherwise reach whatever handler the desktop
+// maps that scheme to.
+function isWebLink(url) {
+  return /^https:\/\/\S+$/i.test(String(url || ""))
+}
+
 function nextEvent(events, now) {
   for (var i = 0; i < events.length; i++) {
     if (events[i].allDay) continue

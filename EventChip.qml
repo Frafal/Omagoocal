@@ -87,6 +87,7 @@ Rectangle {
       visible: !root.compact && root.height > Style.space(28)
         && root.width > Style.space(92)
       text: Model.clockLabel(root.event.startAt, root.panel.hours12)
+      textFormat: Text.PlainText
       color: Util.alpha(root.panel.ink, 0.6)
       font.family: root.panel.mono
       font.pixelSize: Style.font.caption
@@ -97,7 +98,10 @@ Rectangle {
       width: parent.width
       height: root.compact ? root.height : implicitHeight
       verticalAlignment: root.compact ? Text.AlignVCenter : Text.AlignTop
+      // Remote text is never parsed as markup — same rule as every
+      // first-party Omarchy panel.
       text: root.event.title
+      textFormat: Text.PlainText
       color: root.panel.ink
       font.family: root.panel.mono
       font.pixelSize: root.compact ? Style.font.caption : Style.font.bodySmall
@@ -111,6 +115,7 @@ Rectangle {
       width: parent.width
       visible: !root.compact && root.event.location !== "" && root.height > Style.space(56)
       text: "󰍎 " + root.event.location
+      textFormat: Text.PlainText
       color: Util.alpha(root.panel.ink, 0.5)
       font.family: root.panel.mono
       font.pixelSize: Style.font.caption
@@ -126,7 +131,7 @@ Rectangle {
     acceptedButtons: Qt.LeftButton | Qt.MiddleButton
     onClicked: function(mouse) {
       if (root.overflow) root.overflowClicked()
-      else if (mouse.button === Qt.MiddleButton && root.event.link)
+      else if (mouse.button === Qt.MiddleButton && Model.isWebLink(root.event.link))
         Quickshell.execDetached(["/usr/bin/xdg-open", root.event.link])
       else
         root.panel.edit(root.event)

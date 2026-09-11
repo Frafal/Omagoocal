@@ -2,7 +2,7 @@
 const fs = require('fs')
 const src = fs.readFileSync(__dirname + '/Model.js', 'utf8').replace('.pragma library', '')
 const M = {}
-new Function('exports', src + '\n;Object.assign(exports,{luma,isLightSurface,chipAlpha,dayKey,addDays,inclusiveEndDay,exclusiveEndDate,dueNotifications,weekdayLabel,startOfWeek,monthGrid,layout,decorateAll,onDay,splitAllDay,dayBounds,parseStamp,rfc3339,isoWeek,readableOn,relative,weekdayLabels,nextEvent,parseDayInput,parseTimeInput,combine,EVENT_COLORS})')(M)
+new Function('exports', src + '\n;Object.assign(exports,{escapeMarkup,isWebLink,luma,isLightSurface,chipAlpha,dayKey,addDays,inclusiveEndDay,exclusiveEndDate,dueNotifications,weekdayLabel,startOfWeek,monthGrid,layout,decorateAll,onDay,splitAllDay,dayBounds,parseStamp,rfc3339,isoWeek,readableOn,relative,weekdayLabels,nextEvent,parseDayInput,parseTimeInput,combine,EVENT_COLORS})')(M)
 
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ': ' + JSON.stringify(a) + ' != ' + JSON.stringify(b)) }
 const ok = (c, m) => { if (!c) throw new Error(m) }
@@ -212,5 +212,15 @@ ok(!M.isLightSurface('#ff000814'), 'alpha-prefixed dark colour stays dark')
 ok(M.chipAlpha(true, false) > M.chipAlpha(false, false), 'light surfaces need a heavier wash')
 ok(M.chipAlpha(true, true) > M.chipAlpha(true, false), 'hover always deepens')
 ok(M.chipAlpha(false, true) > M.chipAlpha(false, false), 'on dark too')
+
+// remote text never becomes markup in a notification; only web links open
+eq(M.escapeMarkup('<b>Pay</b> & <a href="x">go</a>'), '&lt;b&gt;Pay&lt;/b&gt; &amp; &lt;a href="x"&gt;go&lt;/a&gt;', 'markup escaped')
+eq(M.escapeMarkup(null), '', 'null is empty')
+ok(M.isWebLink('https://calendar.google.com/event?eid=abc'), 'https link opens')
+ok(!M.isWebLink('file:///etc/passwd'), 'file:// never opens')
+ok(!M.isWebLink('javascript:alert(1)'), 'javascript: never opens')
+ok(!M.isWebLink('http://example.com'), 'plain http is not a calendar link')
+ok(!M.isWebLink('https://x y'), 'whitespace is rejected')
+ok(!M.isWebLink(''), 'empty is rejected')
 
 console.log('all checks passed')
