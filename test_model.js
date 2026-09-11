@@ -223,4 +223,12 @@ ok(!M.isWebLink('http://example.com'), 'plain http is not a calendar link')
 ok(!M.isWebLink('https://x y'), 'whitespace is rejected')
 ok(!M.isWebLink(''), 'empty is rejected')
 
+// an unparseable timestamp is dropped rather than becoming NaN geometry
+const withBad = M.decorateAll([
+  { id: 'ok', start: '2026-01-05T09:00:00', end: '2026-01-05T10:00:00' },
+  { id: 'bad', start: 'not a date', end: '2026-01-05T10:00:00' },
+  { id: 'bad2', start: '2026-01-05T09:00:00', end: '' },
+])
+eq(withBad.map(e => e.id), ["ok"], "invalid timestamps are dropped")
+
 console.log('all checks passed')

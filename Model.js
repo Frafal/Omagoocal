@@ -98,7 +98,12 @@ function decorate(ev) {
 function decorateAll(list) {
   var out = []
   for (var i = 0; i < (list || []).length; i++) {
-    if (list[i] && !list[i].error) out.push(decorate(list[i]))
+    if (!list[i] || list[i].error) continue
+    var ev = decorate(list[i])
+    // A timestamp the API sent that does not parse would become NaN
+    // geometry and an unsortable entry; it is dropped, not drawn.
+    if (isNaN(ev.startAt.getTime()) || isNaN(ev.endAt.getTime())) continue
+    out.push(ev)
   }
   out.sort(function (a, b) { return a.startAt - b.startAt })
   return out

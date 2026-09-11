@@ -57,18 +57,21 @@ Item {
   function commit() {
     if (problem !== "") return
     var parts = calendarKey.split("\t")
-    panel.saveEvent({
+    var out = {
       id: draft.id,
       account: parts[0],
       calendarId: parts[1],
       title: titleField.text.trim(),
       allDay: allDay,
       startAt: parsedStart,
-      endAt: parsedEnd,
-      location: locationField.text.trim(),
-      description: notesField.text,
-      colorId: colorId
-    })
+      endAt: parsedEnd
+    }
+    // Send only what changed. The notes field is one line; a description
+    // with paragraphs that was never touched must reach Google untouched.
+    if (locationField.text.trim() !== String(draft.location || "")) out.location = locationField.text.trim()
+    if (notesField.text !== String(draft.description || "")) out.description = notesField.text
+    if (colorId !== String(draft.colorId || "")) out.colorId = colorId
+    panel.saveEvent(out)
   }
 
   // Nudging the end along with the start is what everyone means: moving a

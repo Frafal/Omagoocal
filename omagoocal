@@ -44,7 +44,7 @@ BUSCTL = "/usr/bin/busctl"
 ACCOUNT_CHOOSERS = (["/usr/bin/gnome-online-accounts-gtk"],
                     ["/usr/bin/gnome-control-center", "online-accounts"])
 
-MAX_RESPONSE_BYTES = 8 * 1024 * 1024   # one API response
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024   # one API response (a 2500-event page is ~2-3 MB)
 MAX_PAGES = 20                         # one paginated listing
 MAX_ITEMS = 5000                       # ...and its aggregate size
 MAX_STATE_BYTES = 16 * 1024 * 1024     # one file in the state directory
@@ -62,13 +62,10 @@ MAX_DESCRIPTION = 8192
 MAX_SHORT = 512                         # ids, names, colours, links, emails
 MAX_TOTAL_EVENTS = 10000                # across every calendar in one sync
 MAX_TOTAL_CALENDARS = 500               # across every account
-MAX_SYNC_BYTES = 24 * 1024 * 1024       # raw response bytes across one whole sync
+MAX_SYNC_BYTES = 16 * 1024 * 1024       # raw response bytes across one whole sync
+READ_CHUNK = 64 * 1024                  # network and file reads are charged per chunk
 
 STATE = os.path.expanduser("~/.local/state/omagoocal")
-_OLD_STATE = os.path.expanduser("~/.local/state/omarchy-gcal")
-if (os.path.isdir(_OLD_STATE) and not os.path.islink(_OLD_STATE)
-        and not os.path.lexists(STATE)):
-    os.rename(_OLD_STATE, STATE)             # pre-rename builds kept prefs here
 CONFIG = os.path.join(STATE, "config.json")
 CACHE = os.path.join(STATE, "cache.json")        # calendar lists + palettes, TTL
 LAST_SYNC = os.path.join(STATE, "last-sync.json")  # the panel paints this at startup
@@ -84,6 +81,38 @@ DEFAULTS = {
     "refreshMinutes": 5,
     "snapshot": True,       # keep the last sync on disk so opens are instant
 }
+
+# Accepted ranges for the numeric and enumerated preferences. Anything else,
+# and any key not in DEFAULTS, falls back — the config file is ours, but the
+# panel treats what comes back as the schema it promised, so it is one.
+CONFIG_RANGES = {
+    "notifyMinutes": (0, 1440),
+    "weekStart": (0, 6),
+    "dayStartHour": (0, 23),
+    "refreshMinutes": (1, 1440),
+}
+CONFIG_ENUMS = {"defaultView": ("day", "week", "month")}
+
+
+def _coerce_config(raw):
+    cfg = dict(DEFAULTS)
+    if not isinstance(raw, dict):
+        return cfg
+    for key, default in DEFAULTS.items():
+        value = raw.get(key, default)
+        if isinstance(default, bool):
+            cfg[key] = value if isinstance(value, bool) else default
+        elif isinstance(default, int):
+            lo, hi = CONFIG_RANGES[key]
+            ok = isinstance(value, int) and not isinstance(value, bool) and lo <= value <= hi
+            cfg[key] = value if ok else default
+        elif isinstance(default, str):
+            cfg[key] = value if value in CONFIG_ENUMS[key] else default
+        elif isinstance(default, dict):
+            cfg[key] = ({k[:2 * MAX_SHORT]: v for k, v in list(value.items())[:MAX_TOTAL_CALENDARS]
+                         if isinstance(k, str) and isinstance(v, bool)}
+                        if isinstance(value, dict) else {})
+    return cfg
 
 
 # ------------------------------------------------------------------ storage
@@ -104,7 +133,7 @@ def _state_fd():
             return _state_cache
         if not os.path.lexists(STATE):
             os.makedirs(STATE, mode=0o700)
-        fd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         st = os.fstat(fd)
         if st.st_uid != os.getuid():
             os.close(fd)
@@ -134,10 +163,16 @@ def _read(path, fallback):
     try:
         if not _private_regular(os.fstat(fd)):
             return fallback
-        raw = os.read(fd, MAX_STATE_BYTES + 1)
-        if len(raw) > MAX_STATE_BYTES:
-            return fallback
-        return json.loads(raw)
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, READ_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_STATE_BYTES:
+                return fallback
+            chunks.append(chunk)
+        return json.loads(b"".join(chunks))
     except (OSError, ValueError):
         return fallback
     finally:
@@ -162,7 +197,15 @@ def _write(path, data):
                                dir="/proc/self/fd/%d" % dfd)      # 0600, O_EXCL
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, indent=2)
+            # Encoded incrementally with a running count: a document the
+            # reader would refuse is never written in the first place.
+            total = 0
+            for chunk in json.JSONEncoder(indent=2).iterencode(data):
+                total += len(chunk)
+                if total > MAX_STATE_BYTES:
+                    raise RuntimeError("State document over %d MiB; not written"
+                                       % (MAX_STATE_BYTES >> 20))
+                fh.write(chunk)
             fh.flush()
             os.fsync(fh.fileno())
         try:
@@ -183,9 +226,7 @@ def _write(path, data):
 
 
 def load_config():
-    cfg = dict(DEFAULTS)
-    cfg.update(_read(CONFIG, {}))
-    return cfg
+    return _coerce_config(_read(CONFIG, {}))
 
 
 # ------------------------------------------------------------------- goa
@@ -193,9 +234,12 @@ def load_config():
 def busctl(*args):
     """One D-Bus call, decoded. busctl ships with systemd; gdbus would need
     its GVariant output parsed by hand."""
+    # stderr is discarded rather than piped: reading stdout to EOF while a
+    # stderr pipe fills is a deadlock, and a failed call is reported by its
+    # exit status. Our own messages say what was being asked.
     proc = subprocess.Popen([BUSCTL, "--user", "--json=short", *args],
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+                            stderr=subprocess.DEVNULL)
     try:
         # Read a bounded amount and no more; a reply past the cap is killed,
         # not buffered.
@@ -203,17 +247,14 @@ def busctl(*args):
         if len(raw) > MAX_BUSCTL_BYTES:
             proc.kill()
             raise RuntimeError("D-Bus reply over %d MiB" % (MAX_BUSCTL_BYTES >> 20))
-        err = proc.stderr.read(4096)
         rc = proc.wait(timeout=60)
     except subprocess.TimeoutExpired:
         proc.kill()
         raise RuntimeError("busctl did not finish")
     finally:
         proc.stdout.close()
-        proc.stderr.close()
     if rc != 0:
-        detail = err.decode(errors="replace").strip().splitlines() or ["busctl failed"]
-        raise RuntimeError(detail[-1][:400])
+        raise RuntimeError("busctl exited %d" % rc)
     return json.loads(raw.decode(errors="replace") or "{}")
 
 
@@ -330,18 +371,26 @@ def request(url, data=None, headers=None, method=None, budget=None):
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, method=method,
                                  headers=headers or {})
+    raw = bytearray()
     try:
         with _opener.open(req, timeout=30) as resp:
-            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+            # Chunked, and each chunk charged to the budget as it arrives, so
+            # neither this response nor the sync as a whole can grow past its
+            # ceiling by more than one chunk before being stopped.
+            while True:
+                chunk = resp.read(READ_CHUNK)
+                if not chunk:
+                    break
+                raw += chunk
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise RuntimeError("Response over %d MiB from %s"
+                                       % (MAX_RESPONSE_BYTES >> 20, url.split("?")[0]))
+                if budget:
+                    budget.charge(nbytes=len(chunk))
     except urllib.error.HTTPError as exc:
         detail = exc.read(4096).decode(errors="replace")[:400]
         raise RuntimeError("%s %s: %s" % (exc.code, url.split("?")[0], detail))
-    if len(raw) > MAX_RESPONSE_BYTES:
-        raise RuntimeError("Response over %d MiB from %s"
-                           % (MAX_RESPONSE_BYTES >> 20, url.split("?")[0]))
-    if budget:
-        budget.charge(nbytes=len(raw))       # before decoding allocates again
-    return json.loads(raw) if raw else {}
+    return json.loads(bytes(raw)) if raw else {}
 
 
 def api(account, path, params=None, payload=None, method=None, budget=None):
@@ -573,25 +622,33 @@ def events(time_min, time_max, calendars=None, fresh=False):
     return out
 
 
+def _require(args, *keys):
+    for key in keys:
+        if not isinstance(args.get(key), str) or not args[key]:
+            raise RuntimeError("Missing or invalid field: " + key)
+
+
 def _body(args):
+    """The event document to send. PATCH leaves absent fields alone, so a
+    field is included only when the caller sent it — and then exactly as
+    sent, empty meaning cleared. That is what keeps a multi-line description
+    the editor never showed from being flattened on every save."""
+    _require(args, "start", "end")
     payload = {"summary": _text(args.get("title"), MAX_TITLE) or "(no title)"}
-    if args.get("allDay"):
-        payload["start"] = {"date": args["start"]}
-        payload["end"] = {"date": args["end"]}
-    else:
-        payload["start"] = {"dateTime": args["start"]}
-        payload["end"] = {"dateTime": args["end"]}
+    kind = "date" if args.get("allDay") is True else "dateTime"
+    payload["start"] = {kind: _text(args["start"], MAX_SHORT)}
+    payload["end"] = {kind: _text(args["end"], MAX_SHORT)}
     for key, limit in (("location", MAX_LOCATION), ("description", MAX_DESCRIPTION)):
-        value = _text(args.get(key), limit)
-        if value:
-            payload[key] = value
-    color = _text(str(args.get("colorId", "")), 4)
-    if color.isdigit():
-        payload["colorId"] = color
+        if key in args:
+            payload[key] = _text(args[key], limit)
+    if "colorId" in args:
+        color = _text(str(args["colorId"]), 4)
+        payload["colorId"] = color if color.isdigit() else None   # null clears it
     return payload
 
 
 def save(args):
+    _require(args, "account", "calendarId")
     path = "/calendars/%s/events" % urllib.parse.quote(args["calendarId"], safe="")
     if args.get("id"):
         return api(args["account"], path + "/" + urllib.parse.quote(args["id"], safe=""),
@@ -600,6 +657,7 @@ def save(args):
 
 
 def delete(args):
+    _require(args, "account", "calendarId", "id")
     api(args["account"],
         "/calendars/%s/events/%s" % (urllib.parse.quote(args["calendarId"], safe=""),
                                      urllib.parse.quote(args["id"], safe="")),
@@ -689,7 +747,9 @@ def main(argv):
         incoming = _payload(argv)
         if not isinstance(incoming, dict):
             raise RuntimeError("Config must be a JSON object")
-        cfg.update(incoming)
+        merged = dict(cfg)
+        merged.update(incoming)
+        cfg = _coerce_config(merged)         # unknown keys and bad values fall away
         _write(CONFIG, cfg)
         if not cfg.get("snapshot", True):
             _remove(LAST_SYNC)
@@ -746,7 +806,10 @@ if __name__ == "__main__":
     signal.signal(signal.SIGALRM, _deadline)
     signal.alarm(DEADLINE_SECONDS)
     try:
-        print(emit(main(sys.argv[1:])))
+        text = emit(main(sys.argv[1:]))
+        signal.alarm(0)                            # the work is done; do not cut the output
+        print(text)
     except Exception as exc:                       # one error shape for the UI
+        signal.alarm(0)
         print(json.dumps({"error": str(exc)[:2000]}))
         sys.exit(1)

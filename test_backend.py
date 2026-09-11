@@ -91,8 +91,12 @@ gcal._state_cache = None
 # -- bounded responses: one oversized body is an error, not a memory spike.
 #    Patched at the opener, which is what request() actually goes through.
 class _Resp:
-    def __init__(self, body): self.body = body
-    def read(self, n=-1): return self.body if n < 0 else self.body[:n]
+    """A response body that is consumed as it is read, like a real socket."""
+    def __init__(self, body): self.body = body; self.pos = 0
+    def read(self, n=-1):
+        end = len(self.body) if n < 0 else min(self.pos + n, len(self.body))
+        chunk = self.body[self.pos:end]; self.pos = end
+        return chunk
     def __enter__(self): return self
     def __exit__(self, *a): return False
 real_open = gcal._opener.open
@@ -253,7 +257,7 @@ assert gcal.main(["snapshot"])["timeMin"] == "a"
 # -- outgoing fields are capped and typed like incoming ones
 big = gcal._body({"title": "t" * 5000, "start": "2026-01-01T09:00:00-06:00", "end": "2026-01-01T10:00:00-06:00",
                   "description": "d" * 9000, "colorId": "7; DROP"})
-assert len(big["summary"]) == gcal.MAX_TITLE and len(big["description"]) == gcal.MAX_DESCRIPTION and "colorId" not in big
+assert len(big["summary"]) == gcal.MAX_TITLE and len(big["description"]) == gcal.MAX_DESCRIPTION and big["colorId"] is None
 assert gcal._body({"title": {"x": 1}, "start": "2026-01-01", "end": "2026-01-02", "allDay": True})["summary"] == "(no title)"
 
 # -- the budget is enforced while fetching, across calendars, and cancels the
@@ -341,10 +345,75 @@ assert max(len(l) for l in framed.split("\n")) <= gcal.OUTPUT_LINE_BYTES + gcal.
 assert json.loads(framed)["events"][3]["title"] == "t" * 1000, "still one valid document"
 assert json.loads(framed.replace("\n", "")) == json.loads(framed), "and the panel's newline-stripped join is identical"
 
+# -- config schema: wrong types and out-of-range values fall back, unknown keys
+#    are dropped, calendars must be a str->bool map
+c = gcal._coerce_config({"notifyMinutes": "10", "weekStart": 9, "defaultView": "yesterday",
+                         "hours12": 1, "calendars": [1, 2], "evil": "x", "refreshMinutes": 0})
+assert c["notifyMinutes"] == 10 and c["weekStart"] == 1 and c["defaultView"] == "week"
+assert c["hours12"] is False and c["calendars"] == {} and "evil" not in c and c["refreshMinutes"] == 5
+c = gcal._coerce_config({"weekStart": 0, "calendars": {"a\tb": False, "c": "no"}, "snapshot": False})
+assert c["weekStart"] == 0 and c["calendars"] == {"a\tb": False} and c["snapshot"] is False
+assert gcal._coerce_config("garbage") == gcal.DEFAULTS
+_sys.stdin = io.StringIO(json.dumps({"evil": 1, "dayStartHour": 99, "notifyMinutes": 15}) + "\n")
+gcal.main(["setall"])
+saved_cfg = gcal.load_config()
+assert "evil" not in saved_cfg and saved_cfg["dayStartHour"] == 7 and saved_cfg["notifyMinutes"] == 15
+_sys.stdin = _stdin
+
+# -- save/delete refuse malformed payloads with a named field
+for bad, field in (({"account": "a@b.com"}, "calendarId"),
+                   ({"account": "a@b.com", "calendarId": "c", "title": "t"}, "start"),
+                   ({"account": "a@b.com", "calendarId": "c", "start": "x", "end": ""}, "end")):
+    try:
+        gcal.save(bad); raise AssertionError("must refuse: " + field)
+    except RuntimeError as exc:
+        assert field in str(exc), str(exc)
+try:
+    gcal.delete({"account": "a@b.com", "calendarId": "c"}); raise AssertionError("delete needs an id")
+except RuntimeError as exc:
+    assert "id" in str(exc)
+
+# -- state writes are bounded like state reads; reads cross chunk boundaries
+saved_state = gcal.MAX_STATE_BYTES
+gcal.MAX_STATE_BYTES = 100
+try:
+    gcal._write(gcal.CONFIG, {"x": "y" * 200}); raise AssertionError("oversize state write must refuse")
+except RuntimeError as exc:
+    assert "not written" in str(exc)
+gcal.MAX_STATE_BYTES = saved_state
+assert gcal.load_config()["notifyMinutes"] == 15, "a refused write leaves the old document intact"
+bigdoc = {"blob": "z" * (gcal.READ_CHUNK * 3)}
+gcal._write(gcal.CACHE, bigdoc)
+assert gcal._read(gcal.CACHE, None) == bigdoc, "multi-chunk read reassembles"
+
+# -- response bytes are charged per chunk: the budget trips mid-stream and the
+#    body is never fully read
+class _Drip:
+    def __init__(self, n): self.left = n; self.served = 0
+    def read(self, k=-1):
+        take = self.left if k < 0 else min(k, self.left)
+        self.left -= take; self.served += take
+        return b"x" * take
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+drip = _Drip(gcal.READ_CHUNK * 10)
+real_open = gcal._opener.open
+gcal._opener.open = lambda req, timeout=None: drip
+b3 = gcal.Budget(items=10, nbytes=gcal.READ_CHUNK * 2 + 1, what="t")
+try:
+    gcal.request(gcal.API + "/x", budget=b3); raise AssertionError("budget must trip mid-stream")
+except gcal.BudgetExceeded:
+    pass
+assert drip.served <= gcal.READ_CHUNK * 3, "reading stopped at the budget, served %d" % drip.served
+gcal._opener.open = real_open
+
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",
-                    "end": "2026-01-01T10:00:00-06:00", "location": ""})
-assert "dateTime" in timed["start"] and "location" not in timed
+                    "end": "2026-01-01T10:00:00-06:00"})
+assert "dateTime" in timed["start"] and "location" not in timed, "absent field is left alone"
+cleared = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",
+                      "end": "2026-01-01T10:00:00-06:00", "location": "", "description": "", "colorId": ""})
+assert cleared["location"] == "" and cleared["description"] == "" and cleared["colorId"] is None, "present-empty clears"
 allday = gcal._body({"title": "T", "allDay": True,
                      "start": "2026-01-01", "end": "2026-01-02", "colorId": 5})
 assert allday["start"] == {"date": "2026-01-01"} and allday["colorId"] == "5"

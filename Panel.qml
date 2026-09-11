@@ -28,8 +28,10 @@ Panel {
 
   // The backend ships inside the plugin, so a clone of the repo is the whole
   // thing — nothing to put on PATH before it works.
+  // resolvedUrl percent-encodes, so a home directory with a space in it
+  // must be decoded before it can be executed.
   readonly property string backend:
-    Qt.resolvedUrl("omagoocal").toString().replace(/^file:\/\//, "")
+    decodeURIComponent(Qt.resolvedUrl("omagoocal").toString()).replace(/^file:\/\//, "")
 
   // ---------------------------------------------------------------- state
   property string view: "week"                  // day | week | month | settings
@@ -204,8 +206,10 @@ Panel {
   function applySync(payload, fromCache) {
     if (payload.error) { error = payload.error; return }
     var status = payload.status || {}
-    // Never let a sync that started before an unsaved edit overwrite it.
-    if (!configProc.running && !configDirty) {
+    // Never let a sync that started before an unsaved edit overwrite it, and
+    // never let the startup snapshot — possibly older than config.json —
+    // overwrite what status just read.
+    if (!fromCache && !configProc.running && !configDirty) {
       var incoming = status.config || {}
       if (calendarsLocal) incoming.calendars = cfg.calendars
       cfg = incoming
@@ -232,10 +236,23 @@ Panel {
   // Payloads travel on stdin, not argv: argv is readable by every local
   // process, and these carry event text and settings. Same pattern Omarchy's
   // network panel uses for Wi-Fi secrets.
-  function mutate(command, payload, onDone) {
-    mutateProc.pending = onDone || null
-    mutateProc.payload = JSON.stringify(payload)
-    mutateProc.command = [root.backend, command]
+  property var mutationQueue: []
+
+  function mutate(command, payload, onDone, onFail) {
+    mutationQueue.push({ command: command, payload: payload, onDone: onDone || null, onFail: onFail || null })
+    pumpMutations()
+  }
+
+  // One process, one mutation at a time: a delete followed at once by a
+  // create must not overwrite each other's command or callback.
+  function pumpMutations() {
+    if (mutateProc.running || mutationQueue.length === 0) return
+    var job = mutationQueue.shift()
+    busy = true
+    mutateProc.pending = job.onDone
+    mutateProc.failed = job.onFail
+    mutateProc.payload = JSON.stringify(job.payload)
+    mutateProc.command = [root.backend, job.command]
     mutateProc.running = true
   }
 
@@ -344,23 +361,30 @@ Panel {
       calendarId: ev.calendarId,
       title: ev.title || "(no title)",
       allDay: ev.allDay,
-      location: ev.location,
-      description: ev.description,
-      colorId: ev.colorId,
       start: ev.allDay ? Model.dayKey(ev.startAt) : Model.rfc3339(ev.startAt),
       // The editor works in inclusive days; Google wants the exclusive one.
       end: ev.allDay ? Model.exclusiveEndDate(ev.endAt) : Model.rfc3339(ev.endAt)
     }
+    // Only fields the editor actually changed travel: PATCH leaves the rest
+    // alone, which is what keeps a description the single-line field could
+    // not show from being flattened on every save.
+    if ("location" in ev) payload.location = ev.location
+    if ("description" in ev) payload.description = ev.description
+    if ("colorId" in ev) payload.colorId = ev.colorId
+
+    var draft = editing
     editing = null
-    busy = true
-    mutate("save", payload, function() { loadedKey = ""; ensureRange() })
+    mutate("save", payload,
+           function() { loadedKey = ""; ensureRange() },
+           function() { editing = draft })       // failed: hand the text back
   }
 
   function deleteEvent(ev) {
+    var draft = editing
     editing = null
-    busy = true
     mutate("delete", { account: ev.account, calendarId: ev.calendarId, id: ev.id },
-           function() { loadedKey = ""; ensureRange() })
+           function() { loadedKey = ""; ensureRange() },
+           function() { editing = draft })
   }
 
   // ------------------------------------------------------- notifications
@@ -487,6 +511,7 @@ Panel {
   // process is killed and what was buffered is dropped — never collected
   // in full first, which is what StdioCollector would do.
   component BackendOutput: SplitParser {
+    splitMarker: "\n"
     property var proc
     property var lines: []
     property int bytes: 0
@@ -551,6 +576,7 @@ Panel {
   Process {
     id: mutateProc
     property var pending: null
+    property var failed: null
     property string payload: ""
     stdinEnabled: true
     stdout: BackendOutput { id: mutateOut; proc: mutateProc }
@@ -560,9 +586,11 @@ Panel {
       var result = {}
       if (mutateOut.overflowed) { mutateOut.take(); result = { error: "Backend output exceeded the size limit." } }
       else try { result = JSON.parse(mutateOut.take() || "{}") } catch (e) { result = { error: "Backend returned junk." } }
-      if (result.error) root.error = result.error
+      if (result.error) { root.error = result.error; if (mutateProc.failed) mutateProc.failed() }
       else if (mutateProc.pending) mutateProc.pending()
       mutateProc.pending = null
+      mutateProc.failed = null
+      Qt.callLater(root.pumpMutations)
     }
   }
 
@@ -570,8 +598,12 @@ Panel {
     id: configProc
     property string payload: ""
     stdinEnabled: true
-    onStarted: { write(payload + "\n"); payload = "" }
+    stdout: BackendOutput { id: configOut; proc: configProc }
+    onStarted: { configOut.reset(); write(payload + "\n"); payload = "" }
     onExited: {
+      var result = {}
+      try { result = JSON.parse(configOut.take() || "{}") } catch (e) {}
+      if (result.error) root.error = "Settings were not saved: " + result.error
       if (root.configDirty) { root.persistConfig(); return }
       if (!root.refreshAfterConfig) return
       root.refreshAfterConfig = false

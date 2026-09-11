@@ -159,6 +159,9 @@ from the surface luminance. Verified on `futurenergy`, `catppuccin-latte`,
   occurrence, not the series.
 - **Deleting asks first.** Everything else is reversible from Google Calendar;
   a delete from here is not.
+- **Edits send only what you changed.** The notes field is one line; a
+  description with paragraphs that you never touched reaches Google
+  untouched. Clearing a field clears it.
 - **All-day events** are edited in inclusive days — a one-day event starts and
   ends on the same date, even though Google stores the end exclusively.
 - **Notifications** go through `notify-send`. If you have Do Not Disturb on,
