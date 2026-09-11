@@ -458,7 +458,7 @@ gcal._tokens.clear()
 
 # -- the CLI shebang names the isolated system interpreter
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "omagoocal")) as fh:
-    assert fh.readline().rstrip() == "#!/usr/bin/python3 -I", "shebang must be the isolated system interpreter"
+    assert fh.readline().rstrip() == "#!/usr/bin/python3 -IXutf8", "shebang must be the isolated, UTF-8 system interpreter"
 
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",
@@ -537,4 +537,33 @@ gcal.events("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z", fresh=True)
 assert any(p.endswith("calendarList") for p in paths[before + 2:]), "fresh bypasses the cache"
 
 assert all(a[0] != "call" or a[1] == gcal.GOA for a in calls), "only GOA was ever addressed"
+
+# -- forget clears the cache and spawns nothing: the sign-in window is the shell's job
+_spawned = []
+_real_popen = gcal.subprocess.Popen
+gcal.subprocess.Popen = lambda *a, **k: (_spawned.append(a), _real_popen(*a, **k))[1]
+try:
+    gcal._write(gcal.CACHE, {"calendars": {"x@y": {"at": 1, "value": []}}})
+    assert gcal.main(["forget"]) == {"ok": True}
+    assert gcal._read(gcal.CACHE, None) == {}, "forget must empty the cache"
+    assert _spawned == [], "forget must not start a process"
+    assert not hasattr(gcal, "account_chooser") and not hasattr(gcal, "ACCOUNT_CHOOSERS")
+finally:
+    gcal.subprocess.Popen = _real_popen
+
+# -- an account identity with control characters cannot poison the config key
+_saved_busctl = gcal.busctl
+gcal._accounts_cache = None
+gcal.busctl = lambda *a: {"data": [{
+    "/a": {"org.gnome.OnlineAccounts.Account": {"ProviderType": {"data": "google"},
+             "PresentationIdentity": {"data": "bad\tname@example.com"}}},
+    "/b": {"org.gnome.OnlineAccounts.Account": {"ProviderType": {"data": "google"},
+             "PresentationIdentity": {"data": "\x00\x1f"}}},
+}]}
+try:
+    accounts = gcal.goa_accounts()
+    assert accounts == {"badname@example.com": "/a"}, accounts
+finally:
+    gcal.busctl = _saved_busctl
+    gcal._accounts_cache = None
 print("all checks passed")

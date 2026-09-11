@@ -67,7 +67,8 @@ that path is resolved through `PATH`, and nothing in the shell's environment
 can reach it: the panel runs it as `/usr/bin/python3 -I` (isolated mode —
 `PYTHON*` variables and the user site are ignored) with an explicit minimal
 environment of `HOME`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`
-only. It
+only — it never opens a window or sees a display; the sign-in window is a
+separate program the shell starts by absolute path. It
 calls `/usr/bin/busctl`, `/usr/bin/notify-send`, `/usr/bin/xdg-open`,
 `/usr/bin/pacman` and Omarchy's own installer under `/usr/share/omarchy/bin`
 by absolute path. Every API response is capped at 8 MiB, every paginated

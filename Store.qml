@@ -33,8 +33,9 @@ Item {
   // minimal environment: only what the interpreter needs to find our state
   // directory and the session bus. Under clearEnvironment, null means "pass
   // the system's value", so nothing else from the shell — PYTHONPATH,
-  // LD_PRELOAD, a proxy — can reach it. The login process is the exception:
-  // it launches a GTK window and needs the display.
+  // LD_PRELOAD, a proxy — can reach it. No exception: the sign-in window is
+  // a separate program the shell opens itself, so the helper never needs
+  // a display.
   component BackendProcess: Process {
     clearEnvironment: true
     environment: ({
@@ -209,9 +210,15 @@ Item {
   }
 
   // One process, one mutation at a time: a delete followed at once by a
-  // create must not overwrite each other's command or callback.
+  // create must not overwrite each other's command or callback. The guard
+  // is our own flag, not the process's `running`: Quickshell may start a
+  // process later than it was asked to (during a reload, for one), and two
+  // jobs queued inside that window would otherwise share one process.
+  property bool mutating: false
+
   function pumpMutations() {
-    if (mutateProc.running || mutationQueue.length === 0) return
+    if (mutating || mutationQueue.length === 0) return
+    mutating = true
     var job = mutationQueue.shift()
     busy = true
     mutateProc.pending = job.onDone
@@ -269,10 +276,16 @@ Item {
     setConfig("calendars", map)
   }
 
-  // Sign-in is GOA's window, showing Google's own consent screen. We only
-  // open it, then watch for the account to appear.
+  // Sign-in is GOA's window, showing Google's own consent screen. The shell
+  // opens that window directly by absolute path — the token-bearing helper
+  // is never run with a display environment — and tells the helper to drop
+  // its caches, then watches for the account to appear. The package that
+  // ships the window is a checked dependency, so the path is fixed.
+  readonly property string accountWindow: "/usr/bin/gnome-online-accounts-gtk"
+
   function login() {
     error = ""
+    Quickshell.execDetached([accountWindow])
     loginProc.running = true
     accountWatch.restart()
   }
@@ -461,6 +474,7 @@ Item {
     // right callback, release the queue.
     function settle(result) {
       store.busy = false
+      store.mutating = false
       if (result.error) { store.error = result.error; if (failed) failed() }
       else if (pending) pending()
       pending = null
@@ -540,9 +554,9 @@ Item {
     }
   }
 
-  Process {
+  BackendProcess {
     id: loginProc
-    command: store.backendCmd.concat(["login"])
+    command: store.backendCmd.concat(["forget"])
     stdout: BackendOutput { id: loginOut; proc: loginProc }
     onStarted: loginOut.reset()
     onExited: function(code) {

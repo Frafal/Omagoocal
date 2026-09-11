@@ -1,4 +1,4 @@
-#!/usr/bin/python3 -I
+#!/usr/bin/python3 -IXutf8
 """Google Calendar backend for Omagoocal, the Omarchy shell plugin.
 
 Stdlib only, on purpose: this runs inside a desktop shell that should not
@@ -15,8 +15,8 @@ Talking to GOA goes through `busctl --json`, so there is no python-gobject
 dependency either. Every subcommand prints one JSON document on stdout.
 
 This process holds a Google OAuth access token while it runs, so nothing on
-the way to it is looked up through PATH: the interpreter, busctl and the GOA
-account window are all fixed absolute paths, state lives in a directory that
+the way to it is looked up through PATH: the interpreter and busctl are
+fixed absolute paths, it opens no window and inherits no display, state lives in a directory that
 is checked to be ours and private before every read or write, and every
 network response and page walk has a ceiling.
 """
@@ -42,8 +42,7 @@ GOA = "org.gnome.OnlineAccounts"
 GOA_ROOT = "/org/gnome/OnlineAccounts"
 
 BUSCTL = "/usr/bin/busctl"
-ACCOUNT_CHOOSERS = (["/usr/bin/gnome-online-accounts-gtk"],
-                    ["/usr/bin/gnome-control-center", "online-accounts"])
+BUSCTL_SECONDS = 60                    # a reply that never ends is killed, not waited on
 
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024   # one API response (a 2500-event page is ~2-3 MB)
 MAX_PAGES = 20                         # one paginated listing
@@ -243,6 +242,11 @@ def busctl(*args):
     proc = subprocess.Popen([BUSCTL, "--user", "--json=short", *args],
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
+    # The read below blocks until the reply is complete; this is its own
+    # deadline, independent of the process-wide alarm, so a broker that
+    # never answers costs one minute, not two.
+    reaper = threading.Timer(BUSCTL_SECONDS, proc.kill)
+    reaper.start()
     try:
         # Read a bounded amount and no more; a reply past the cap is killed,
         # not buffered.
@@ -250,11 +254,12 @@ def busctl(*args):
         if len(raw) > MAX_BUSCTL_BYTES:
             proc.kill()
             raise RuntimeError("D-Bus reply over %d MiB" % (MAX_BUSCTL_BYTES >> 20))
-        rc = proc.wait(timeout=60)
+        rc = proc.wait(timeout=BUSCTL_SECONDS)
     except subprocess.TimeoutExpired:
         proc.kill()
         raise RuntimeError("busctl did not finish")
     finally:
+        reaper.cancel()
         proc.stdout.close()
     if rc != 0:
         raise RuntimeError("busctl exited %d" % rc)
@@ -289,7 +294,11 @@ def goa_accounts():
             continue
         email = (account.get("PresentationIdentity", {}).get("data")
                  or account.get("Identity", {}).get("data") or path)
-        found[email] = path
+        # The identity becomes half of a tab-joined config key and a field
+        # the panel renders, so it is held to the same schema as remote text.
+        email = _CONTROL.sub("", _text(email, MAX_SHORT))
+        if email:
+            found[email] = path
     _accounts_cache = found
     return found
 
@@ -710,32 +719,17 @@ def _payload(argv):
     return json.loads(line)
 
 
-def account_chooser():
-    """The GOA account window, if one is installed. gnome-online-accounts-gtk
-    is the small standalone panel; control-center is the fallback for anyone
-    who already has GNOME. Absolute paths only — no PATH lookup."""
-    for argv in ACCOUNT_CHOOSERS:
-        if os.access(argv[0], os.X_OK):
-            return argv
-    return None
-
-
-
 def main(argv):
     cmd = argv[0] if argv else "status"
     cfg = load_config()
 
     if cmd == "status":
         return {"accounts": sorted(goa_accounts()), "config": cfg}
-    if cmd == "login":
-        # GOA owns the sign-in window; this just opens it. Google's own
-        # consent screen appears inside it.
-        chooser = account_chooser()
-        if not chooser:
-            raise RuntimeError("Install gnome-online-accounts-gtk to add an account.")
-        subprocess.Popen(chooser, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _write(CACHE, {})                    # whatever comes back is new
+    if cmd == "forget":
+        # An account is about to be added or changed in GOA's own window,
+        # which the shell opens by absolute path; this process never needs a
+        # display. Whatever was cached about calendar lists is now stale.
+        _write(CACHE, {})
         return {"ok": True}
     if cmd == "sync":                      # sync <timeMin> <timeMax> [fresh]
         # One call per refresh. The panel needs all three together and every
