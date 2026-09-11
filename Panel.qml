@@ -423,6 +423,7 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         if (root.everSynced) return
+        if (String(text || "").length > root.maxBackendOutput) return
         try {
           var snap = JSON.parse(String(text || "{}"))
           // Only if the saved window still covers the one we are about to
@@ -453,12 +454,43 @@ Panel {
     onTriggered: { root.loadedKey = ""; root.ensureRange() }
   }
 
+  // Every backend process gets a hard deadline. The backend alarms itself
+  // at 120s; this is the outer wall for the case where it cannot, so a hung
+  // helper is killed, never waited on.
+  component Deadline: Timer {
+    property var target
+    property int seconds
+    interval: seconds * 1000
+    running: target ? target.running === true : false
+    onTriggered: {
+      if (!target || !target.running) return
+      target.signal(9)
+      root.error = "The backend stopped answering and was terminated."
+    }
+  }
+
+  Deadline { target: syncProc; seconds: 150 }
+  Deadline { target: statusProc; seconds: 30 }
+  Deadline { target: snapshotProc; seconds: 30 }
+  Deadline { target: mutateProc; seconds: 90 }
+  Deadline { target: configProc; seconds: 30 }
+  Deadline { target: loginProc; seconds: 30 }
+  Deadline { target: depsProc; seconds: 30 }
+
+  // The producer caps its own output at 16 MiB; this is the consumer-side
+  // ceiling so a misbehaving helper can never fill the shell's memory.
+  readonly property int maxBackendOutput: 20 * 1024 * 1024
+
   Process {
     id: syncProc
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         root.busy = false
+        if (String(text || "").length > root.maxBackendOutput) {
+          root.error = "Backend output exceeded the size limit."
+          return
+        }
         try { root.applySync(JSON.parse(String(text || "{}"))) }
         catch (e) { root.error = "Backend returned junk: " + String(text).substring(0, 120) }
         root.checkNotifications()
@@ -478,6 +510,7 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        if (String(text || "").length > root.maxBackendOutput) return
         try {
           var status = JSON.parse(String(text || "{}"))
           root.cfg = status.config || {}
@@ -502,7 +535,8 @@ Panel {
       onStreamFinished: {
         root.busy = false
         var result = {}
-        try { result = JSON.parse(String(text || "{}")) } catch (e) {}
+        if (String(text || "").length > root.maxBackendOutput) result = { error: "Backend output exceeded the size limit." }
+        else try { result = JSON.parse(String(text || "{}")) } catch (e) {}
         if (result.error) root.error = result.error
         else if (mutateProc.pending) mutateProc.pending()
         mutateProc.pending = null

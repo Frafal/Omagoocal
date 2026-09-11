@@ -66,8 +66,15 @@ Because the backend holds a Google access token while it runs, nothing on
 that path is resolved through `PATH`: it runs under `/usr/bin/python3` and
 calls `/usr/bin/busctl`, `/usr/bin/notify-send`, `/usr/bin/xdg-open`,
 `/usr/bin/pacman` and Omarchy's own installer under `/usr/share/omarchy/bin`
-by absolute path. Every API response is capped at 8 MiB and every paginated
-listing at 20 pages / 5000 items.
+by absolute path. Every API response is capped at 8 MiB, every paginated
+listing at 20 pages / 5000 items, one sync at 10 000 events and 500
+calendars, and the backend's total output at 16 MiB. Remote strings are cut
+to Google's own field limits (title and location 1024, description 8192)
+and every field is coerced to the type the panel expects. The backend ends
+itself after 120 seconds no matter what it is waiting on, and the panel
+kills any helper that outlives its own deadline. State files are only read
+if they are regular files owned by you with mode `0600`, opened
+non-blocking, so nothing planted in the folder can stall it.
 
 No file is ever opened by the panel itself — the snapshot, like every state
 file, is read by the backend through the same validated, no-follow, bounded

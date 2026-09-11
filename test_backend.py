@@ -48,22 +48,23 @@ except OSError:
 gcal.STATE = real_state
 gcal._state_cache = None
 
-# -- bounded responses: one oversized body is an error, not a memory spike
+# -- bounded responses: one oversized body is an error, not a memory spike.
+#    Patched at the opener, which is what request() actually goes through.
 class _Resp:
     def __init__(self, body): self.body = body
     def read(self, n=-1): return self.body if n < 0 else self.body[:n]
     def __enter__(self): return self
     def __exit__(self, *a): return False
-real_urlopen = gcal.urllib.request.urlopen
-gcal.urllib.request.urlopen = lambda req, timeout=None: _Resp(b"x" * (gcal.MAX_RESPONSE_BYTES + 1))
+real_open = gcal._opener.open
+gcal._opener.open = lambda req, timeout=None: _Resp(b"x" * (gcal.MAX_RESPONSE_BYTES + 1))
 try:
-    gcal.request("https://example.invalid/big")
+    gcal.request(gcal.API + "/big")
     raise AssertionError("oversized response must raise")
 except RuntimeError as exc:
     assert "MiB" in str(exc)
-gcal.urllib.request.urlopen = lambda req, timeout=None: _Resp(b'{"ok": true}')
-assert gcal.request("https://example.invalid/small") == {"ok": True}
-gcal.urllib.request.urlopen = real_urlopen
+gcal._opener.open = lambda req, timeout=None: _Resp(b'{"ok": true}')
+assert gcal.request(gcal.API + "/small") == {"ok": True}
+gcal._opener.open = real_open
 
 # -- bounded pagination: an endless nextPageToken stops at the page ceiling
 gcal.api = lambda account, path, params=None, payload=None, method=None: {"items": [1], "nextPageToken": "again"}
@@ -115,7 +116,7 @@ assert gcal._payload(["save", base64.b64encode(b'{"a": 1}').decode()]) == {"a": 
 # -- the offline snapshot: absent reads as {}, kept only while the preference
 #    is on, and removed the moment it is switched off
 assert gcal.main(["snapshot"]) == {}, "no snapshot yet reads as empty"
-gcal._write(gcal.LAST_SYNC, {"timeMin": "a", "timeMax": "b", "payload": {"events": []}})
+gcal._write(gcal.LAST_SYNC, {"timeMin": "a", "timeMax": "b", "payload": {"events": [], "calendars": []}})
 assert gcal.main(["snapshot"])["timeMin"] == "a"
 _sys.stdin = io.StringIO(json.dumps({"snapshot": False}) + "\n")
 gcal.main(["setall"])
@@ -124,6 +125,89 @@ assert gcal.main(["snapshot"]) == {}
 _sys.stdin = io.StringIO(json.dumps({"snapshot": True}) + "\n")
 gcal.main(["setall"])
 _sys.stdin = _stdin
+
+# -- a FIFO or a world-readable file in the state directory is refused, and a
+#    FIFO must not block the read (O_NONBLOCK before the type check)
+import time as _time
+fifo = os.path.join(gcal.STATE, "fifo.json")
+os.mkfifo(fifo, 0o600)
+t0 = _time.monotonic()
+assert gcal._read(fifo, "fallback") == "fallback"
+assert _time.monotonic() - t0 < 1.0, "reading a FIFO must not block"
+try:
+    gcal._write(fifo, {"x": 1}); raise AssertionError("must refuse to replace a FIFO")
+except RuntimeError as exc:
+    assert "non-regular" in str(exc)
+os.unlink(fifo)
+loose = os.path.join(gcal.STATE, "loose.json")
+with open(loose, "w") as fh: fh.write('{"x": 1}')
+os.chmod(loose, 0o644)
+assert gcal._read(loose, "fallback") == "fallback", "group/other-readable file is refused"
+os.chmod(loose, 0o600)
+assert gcal._read(loose, "fallback") == {"x": 1}
+os.unlink(loose)
+
+# -- schema: remote fields are coerced to type and size, never passed through
+assert gcal._text("abc", 2) == "ab" and gcal._text(None, 5) == "" and gcal._text({"a": 1}, 5) == ""
+assert len(gcal._text("x" * 20000, gcal.MAX_DESCRIPTION)) == gcal.MAX_DESCRIPTION
+
+# -- whole-result ceilings: total events across calendars, and total output
+gcal.api = lambda account, path, params=None, payload=None, method=None: (
+    {"items": [{"id": "primary", "summary": "W", "accessRole": "owner"}]} if path.endswith("calendarList")
+    else {"event": {}} if path == "/colors"
+    else {"items": [{"id": "e%d" % i, "summary": {"not": "a string"}, "start": {"date": "2026-01-01"}, "end": {"date": "2026-01-02"}} for i in range(5)]})
+gcal._tokens["a@b.com"] = "t"
+coerced = gcal.events("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z")
+assert [e["title"] for e in coerced] == ["(no title)"] * 5, "non-string summary becomes the placeholder"
+saved_total = gcal.MAX_TOTAL_EVENTS
+gcal.MAX_TOTAL_EVENTS = 3
+try:
+    gcal.events("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z"); raise AssertionError("total-events ceiling must raise")
+except RuntimeError as exc:
+    assert "events in one sync" in str(exc)
+gcal.MAX_TOTAL_EVENTS = saved_total
+gcal._tokens.clear()
+saved_out = gcal.MAX_OUTPUT_BYTES
+gcal.MAX_OUTPUT_BYTES = 10
+try:
+    gcal.emit({"big": "x" * 100}); raise AssertionError("output ceiling must raise")
+except RuntimeError as exc:
+    assert "refusing to emit" in str(exc)
+gcal.MAX_OUTPUT_BYTES = saved_out
+assert gcal.emit({"ok": True}) == '{"ok": true}'
+
+# -- http: only the Calendar API host, and a redirect is refused so the token
+#    can never be forwarded
+try:
+    gcal.request("https://evil.invalid/x"); raise AssertionError("off-API URL must be refused")
+except RuntimeError as exc:
+    assert "outside the Calendar API" in str(exc)
+class _Redirect:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+real_open = gcal._opener.open
+def fake_open(req, timeout=None):
+    raise gcal.urllib.error.HTTPError(req.full_url, 302, "redirect refused for a token-bearing request", {}, None)
+gcal._opener.open = fake_open
+try:
+    gcal.request(gcal.API + "/calendars/x/events"); raise AssertionError("redirect must surface as an error")
+except RuntimeError as exc:
+    assert "302" in str(exc)
+gcal._opener.open = real_open
+assert isinstance(gcal._opener.handlers[0], gcal.urllib.request.BaseHandler)
+assert any(isinstance(h, gcal._NoRedirect) for h in gcal._opener.handlers), "no-redirect handler installed"
+
+# -- snapshot shape is validated on the way out
+gcal._write(gcal.LAST_SYNC, {"timeMin": "a", "timeMax": "b", "payload": {"events": "not a list", "calendars": []}})
+assert gcal.main(["snapshot"]) == {}, "malformed snapshot must read as empty"
+gcal._write(gcal.LAST_SYNC, {"timeMin": "a", "timeMax": "b", "payload": {"events": [], "calendars": []}})
+assert gcal.main(["snapshot"])["timeMin"] == "a"
+
+# -- outgoing fields are capped and typed like incoming ones
+big = gcal._body({"title": "t" * 5000, "start": "2026-01-01T09:00:00-06:00", "end": "2026-01-01T10:00:00-06:00",
+                  "description": "d" * 9000, "colorId": "7; DROP"})
+assert len(big["summary"]) == gcal.MAX_TITLE and len(big["description"]) == gcal.MAX_DESCRIPTION and "colorId" not in big
+assert gcal._body({"title": {"x": 1}, "start": "2026-01-01", "end": "2026-01-02", "allDay": True})["summary"] == "(no title)"
 
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",

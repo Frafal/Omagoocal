@@ -24,6 +24,7 @@ network response and page walk has a ceiling.
 import base64
 import json
 import os
+import signal
 import subprocess
 import stat
 import sys
@@ -48,6 +49,18 @@ MAX_PAGES = 20                         # one paginated listing
 MAX_ITEMS = 5000                       # ...and its aggregate size
 MAX_STATE_BYTES = 16 * 1024 * 1024     # one file in the state directory
 MAX_PAYLOAD_BYTES = 1024 * 1024         # one JSON document on stdin
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024     # everything this process will print
+MAX_BUSCTL_BYTES = 4 * 1024 * 1024      # one D-Bus reply from GOA
+DEADLINE_SECONDS = 120                  # then the process ends itself
+
+# Remote strings are cut to Google's own documented field limits, so nothing
+# legitimate is ever shortened and nothing oversized is ever passed on.
+MAX_TITLE = 1024
+MAX_LOCATION = 1024
+MAX_DESCRIPTION = 8192
+MAX_SHORT = 512                         # ids, names, colours, links, emails
+MAX_TOTAL_EVENTS = 10000                # across every calendar in one sync
+MAX_TOTAL_CALENDARS = 500               # across every account
 
 STATE = os.path.expanduser("~/.local/state/omagoocal")
 _OLD_STATE = os.path.expanduser("~/.local/state/omarchy-gcal")
@@ -100,20 +113,33 @@ def _state_fd():
         return fd
 
 
+def _private_regular(st):
+    """Owned by us, no group/other bits, and an ordinary file — not a FIFO,
+    device or socket that could block or surprise a read."""
+    return (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+            and not (st.st_mode & 0o077))
+
+
 def _read(path, fallback):
     try:
-        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW,
+        # O_NONBLOCK so that even opening a FIFO planted here cannot block;
+        # the fstat below then refuses anything that is not a regular file.
+        fd = os.open(os.path.basename(path),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                      dir_fd=_state_fd())
     except OSError:
         return fallback
     try:
-        with os.fdopen(fd) as fh:
-            text = fh.read(MAX_STATE_BYTES + 1)
-        if len(text) > MAX_STATE_BYTES:
+        if not _private_regular(os.fstat(fd)):
             return fallback
-        return json.loads(text)
+        raw = os.read(fd, MAX_STATE_BYTES + 1)
+        if len(raw) > MAX_STATE_BYTES:
+            return fallback
+        return json.loads(raw)
     except (OSError, ValueError):
         return fallback
+    finally:
+        os.close(fd)
 
 
 def _remove(path):
@@ -138,8 +164,11 @@ def _write(path, data):
             fh.flush()
             os.fsync(fh.fileno())
         try:
-            if stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode):
+            existing = os.lstat(name, dir_fd=dfd)
+            if stat.S_ISLNK(existing.st_mode):
                 raise RuntimeError("Refusing to write through a symlink: " + name)
+            if not stat.S_ISREG(existing.st_mode):
+                raise RuntimeError("Refusing to replace a non-regular file: " + name)
         except FileNotFoundError:
             pass
         os.replace(os.path.basename(tmp), name, src_dir_fd=dfd, dst_dir_fd=dfd)
@@ -163,10 +192,13 @@ def busctl(*args):
     """One D-Bus call, decoded. busctl ships with systemd; gdbus would need
     its GVariant output parsed by hand."""
     out = subprocess.run([BUSCTL, "--user", "--json=short", *args],
-                         capture_output=True, text=True, timeout=120)
+                         stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
     if out.returncode != 0:
-        raise RuntimeError((out.stderr or "busctl failed").strip().splitlines()[-1])
-    return json.loads(out.stdout or "{}")
+        detail = out.stderr.decode(errors="replace").strip().splitlines() or ["busctl failed"]
+        raise RuntimeError(detail[-1][:400])
+    if len(out.stdout) > MAX_BUSCTL_BYTES:
+        raise RuntimeError("D-Bus reply over %d MiB" % (MAX_BUSCTL_BYTES >> 20))
+    return json.loads(out.stdout.decode(errors="replace") or "{}")
 
 
 _accounts_cache = None
@@ -226,12 +258,28 @@ def access_token(email):
 
 # --------------------------------------------------------------------- http
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib follows redirects and keeps the Authorization header across
+    hosts. This client carries a Google access token, so a 3xx is refused
+    outright: the Calendar API never redirects, and nowhere else may see
+    the token."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code,
+                                     "redirect refused for a token-bearing request",
+                                     headers, fp)
+
+
+_opener = urllib.request.build_opener(_NoRedirect())
+
+
 def request(url, data=None, headers=None, method=None):
+    if not url.startswith(API + "/"):
+        raise RuntimeError("Refusing request outside the Calendar API: " + url.split("?")[0])
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, method=method,
                                  headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _opener.open(req, timeout=30) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         detail = exc.read(4096).decode(errors="replace")[:400]
@@ -270,6 +318,13 @@ def api_items(account, path, params):
         params["pageToken"] = token
     raise RuntimeError("More than %d pages from %s; refusing to keep going"
                        % (MAX_PAGES, path))
+
+
+def _text(value, limit):
+    """A string within its limit, or nothing. Remote fields are coerced to
+    the schema the panel expects, never passed through as whatever the API
+    happened to send."""
+    return value[:limit] if isinstance(value, str) else ""
 
 
 # ------------------------------------------------------------------ calendar
@@ -323,16 +378,21 @@ def calendar_list(fresh=False):
             out.append({"account": email, "error": error})
             continue
         for cal in items:
+            if not isinstance(cal, dict) or not isinstance(cal.get("id"), str):
+                continue
             key = email + "\t" + cal["id"]
             out.append({
-                "account": email,
-                "id": cal["id"],
-                "name": cal.get("summaryOverride") or cal.get("summary", cal["id"]),
-                "color": cal.get("backgroundColor", "#9fc6e7"),
-                "primary": cal.get("primary", False),
+                "account": _text(email, MAX_SHORT),
+                "id": _text(cal["id"], MAX_SHORT),
+                "name": _text(cal.get("summaryOverride") or cal.get("summary") or cal["id"], MAX_SHORT),
+                "color": _text(cal.get("backgroundColor"), MAX_SHORT) or "#9fc6e7",
+                "primary": cal.get("primary") is True,
                 "writable": cal.get("accessRole") in ("owner", "writer"),
-                "enabled": cfg["calendars"].get(key, True),
+                "enabled": cfg["calendars"].get(key, True) is not False,
             })
+            if len(out) > MAX_TOTAL_CALENDARS:
+                raise RuntimeError("More than %d calendars; refusing to continue"
+                                   % MAX_TOTAL_CALENDARS)
     return out
 
 
@@ -341,8 +401,10 @@ def event_palette(email, fresh=False):
     if cached is not None:
         return cached
     try:
-        palette = {k: v["background"] for k, v in api(email, "/colors")["event"].items()}
-    except (RuntimeError, KeyError):
+        palette = {_text(k, 16): _text(v.get("background"), 16)
+                   for k, v in api(email, "/colors")["event"].items()
+                   if isinstance(k, str) and isinstance(v, dict)}
+    except (RuntimeError, KeyError, AttributeError):
         return {}
     _cache_put("palette", email, palette)
     return palette
@@ -390,43 +452,52 @@ def events(time_min, time_max, calendars=None, fresh=False):
             continue
         palette = palettes.get(cal["account"], {})
         for ev in items:
+            if not isinstance(ev, dict) or not isinstance(ev.get("id"), str):
+                continue
             if ev.get("status") == "cancelled":
                 continue
-            start, end = ev.get("start", {}), ev.get("end", {})
+            start, end = ev.get("start"), ev.get("end")
+            if not isinstance(start, dict) or not isinstance(end, dict):
+                continue
             out.append({
-                "id": ev["id"],
+                "id": _text(ev["id"], MAX_SHORT),
                 "account": cal["account"],
                 "calendarId": cal["id"],
                 "calendarName": cal["name"],
-                "title": ev.get("summary", "(no title)"),
-                "start": start.get("dateTime") or start.get("date", ""),
-                "end": end.get("dateTime") or end.get("date", ""),
+                "title": _text(ev.get("summary"), MAX_TITLE) or "(no title)",
+                "start": _text(start.get("dateTime") or start.get("date"), MAX_SHORT),
+                "end": _text(end.get("dateTime") or end.get("date"), MAX_SHORT),
                 "allDay": "date" in start,
                 # Event colour wins over calendar colour, which is what Google
                 # itself shows: a per-event colour is an explicit override.
-                "color": palette.get(ev.get("colorId", ""), cal["color"]),
-                "location": ev.get("location", ""),
-                "description": ev.get("description", ""),
-                "link": ev.get("htmlLink", ""),
+                "color": _text(palette.get(ev.get("colorId", "")), MAX_SHORT) or cal["color"],
+                "location": _text(ev.get("location"), MAX_LOCATION),
+                "description": _text(ev.get("description"), MAX_DESCRIPTION),
+                "link": _text(ev.get("htmlLink"), MAX_SHORT),
                 "writable": cal["writable"],
-                "recurring": bool(ev.get("recurringEventId")),
+                "recurring": isinstance(ev.get("recurringEventId"), str),
             })
+            if len(out) > MAX_TOTAL_EVENTS:
+                raise RuntimeError("More than %d events in one sync; refusing to continue"
+                                   % MAX_TOTAL_EVENTS)
     return out
 
 
 def _body(args):
-    payload = {"summary": args["title"]}
+    payload = {"summary": _text(args.get("title"), MAX_TITLE) or "(no title)"}
     if args.get("allDay"):
         payload["start"] = {"date": args["start"]}
         payload["end"] = {"date": args["end"]}
     else:
         payload["start"] = {"dateTime": args["start"]}
         payload["end"] = {"dateTime": args["end"]}
-    for key in ("location", "description"):
-        if args.get(key):
-            payload[key] = args[key]
-    if args.get("colorId"):
-        payload["colorId"] = str(args["colorId"])
+    for key, limit in (("location", MAX_LOCATION), ("description", MAX_DESCRIPTION)):
+        value = _text(args.get(key), limit)
+        if value:
+            payload[key] = value
+    color = _text(str(args.get("colorId", "")), 4)
+    if color.isdigit():
+        payload["colorId"] = color
     return payload
 
 
@@ -514,8 +585,14 @@ def main(argv):
         return payload
     if cmd == "snapshot":
         # Read through the same validated, no-follow, bounded path as every
-        # other state file, rather than by the panel opening the file itself.
-        return _read(LAST_SYNC, {})
+        # other state file, rather than by the panel opening the file itself
+        # — and its shape checked, rather than trusted because we wrote it.
+        snap = _read(LAST_SYNC, {})
+        ok = (isinstance(snap, dict) and isinstance(snap.get("timeMin"), str)
+              and isinstance(snap.get("timeMax"), str) and isinstance(snap.get("payload"), dict)
+              and isinstance(snap["payload"].get("events"), list)
+              and isinstance(snap["payload"].get("calendars"), list))
+        return snap if ok else {}
     if cmd == "setall":
         # The panel owns the whole config while it is open, so it writes the
         # whole thing. Last write wins, which is what a settings page means.
@@ -535,9 +612,30 @@ def main(argv):
     raise RuntimeError("Unknown command: " + cmd)
 
 
+def _deadline(signum, frame):
+    # Whatever it was waiting on — a socket, a pipe, stdin — the process
+    # stops now. os._exit so worker threads cannot keep it alive.
+    sys.stdout.write(json.dumps({"error": "Backend exceeded %ds and was stopped"
+                                          % DEADLINE_SECONDS}) + "\n")
+    sys.stdout.flush()
+    os._exit(1)
+
+
+def emit(result):
+    """The one place output is produced: one JSON document, or an error, and
+    never more than MAX_OUTPUT_BYTES of it."""
+    text = json.dumps(result)
+    if len(text) > MAX_OUTPUT_BYTES:
+        raise RuntimeError("Result over %d MiB; refusing to emit"
+                           % (MAX_OUTPUT_BYTES >> 20))
+    return text
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGALRM, _deadline)
+    signal.alarm(DEADLINE_SECONDS)
     try:
-        print(json.dumps(main(sys.argv[1:])))
+        print(emit(main(sys.argv[1:])))
     except Exception as exc:                       # one error shape for the UI
-        print(json.dumps({"error": str(exc)}))
+        print(json.dumps({"error": str(exc)[:2000]}))
         sys.exit(1)
