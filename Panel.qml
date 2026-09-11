@@ -35,7 +35,25 @@ Panel {
   // Run through the system interpreter by absolute path rather than executing
   // the script: the same fixed interpreter the shebang names, but it no
   // longer matters whether a clone preserved the executable bit.
-  readonly property var backendCmd: ["/usr/bin/python3", backend]
+  // -I: isolated mode — PYTHON* environment variables and the user site are
+  // ignored, and the script's own directory is not put on sys.path.
+  // -X utf8: stdin/stdout are UTF-8 regardless of locale.
+  readonly property var backendCmd: ["/usr/bin/python3", "-I", "-X", "utf8", backend]
+
+  // Every process that will hold a Google access token runs with an explicit
+  // minimal environment: only what the interpreter needs to find our state
+  // directory and the session bus. Under clearEnvironment, null means "pass
+  // the system's value", so nothing else from the shell — PYTHONPATH,
+  // LD_PRELOAD, a proxy — can reach it. The login process is the exception:
+  // it launches a GTK window and needs the display.
+  component BackendProcess: Process {
+    clearEnvironment: true
+    environment: ({
+      HOME: null,
+      XDG_RUNTIME_DIR: null,
+      DBUS_SESSION_BUS_ADDRESS: null
+    })
+  }
 
   // ---------------------------------------------------------------- state
   property string view: "week"                  // day | week | month | settings
@@ -63,7 +81,7 @@ Panel {
   property bool installing: false
   property string installError: ""
 
-  readonly property var requiredPackages: ["gnome-online-accounts", "gnome-online-accounts-gtk"]
+  readonly property var requiredPackages: ["gnome-online-accounts", "gnome-online-accounts-gtk", "python"]
   readonly property string pacman: "/usr/bin/pacman"
   readonly property string omarchyBin: "/usr/share/omarchy/bin"
 
@@ -444,7 +462,7 @@ Panel {
   // event to name from the first frame. Read by the backend, not by QML: the
   // backend opens state files no-follow, relative to a validated directory,
   // with a size ceiling — the panel never opens a path itself.
-  Process {
+  BackendProcess {
     id: snapshotProc
     command: root.backendCmd.concat(["snapshot"])
     stdout: BackendOutput { id: snapshotOut; proc: snapshotProc }
@@ -539,7 +557,7 @@ Panel {
     function reset() { lines = []; bytes = 0; overflowed = false }
   }
 
-  Process {
+  BackendProcess {
     id: syncProc
     stdout: BackendOutput { id: syncOut; proc: syncProc }
     onStarted: syncOut.reset()
@@ -555,7 +573,7 @@ Panel {
     }
   }
 
-  Process {
+  BackendProcess {
     id: statusProc
     command: root.backendCmd.concat(["status"])
     stdout: BackendOutput { id: statusOut; proc: statusProc }
@@ -577,7 +595,7 @@ Panel {
     }
   }
 
-  Process {
+  BackendProcess {
     id: mutateProc
     property var pending: null
     property var failed: null
@@ -598,7 +616,7 @@ Panel {
     }
   }
 
-  Process {
+  BackendProcess {
     id: configProc
     property string payload: ""
     stdinEnabled: true

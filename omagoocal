@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Google Calendar backend for Omagoocal, the Omarchy shell plugin.
 
 Stdlib only, on purpose: this runs inside a desktop shell that should not

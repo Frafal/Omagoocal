@@ -453,6 +453,10 @@ gcal.api = lambda account, path, params=None, payload=None, method=None, budget=
 assert [c["id"] for c in gcal.calendar_list(fresh=True)] == ["good"]
 gcal._tokens.clear()
 
+# -- the CLI shebang names the isolated system interpreter
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "omagoocal")) as fh:
+    assert fh.readline().rstrip() == "#!/usr/bin/python3 -I", "shebang must be the isolated system interpreter"
+
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",
                     "end": "2026-01-01T10:00:00-06:00"})

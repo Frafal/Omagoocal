@@ -51,7 +51,7 @@ except your calendar data from Google.
 | Package | Why |
 |---|---|
 | `gnome-online-accounts`, `gnome-online-accounts-gtk` | Google sign-in and token refresh. Installed on demand from the panel. |
-| `python` | The backend is stdlib-only Python 3 — no `pip`, no `python-gobject`. |
+| `python` | The backend is stdlib-only Python 3 — no `pip`, no `python-gobject`. Installed on demand with the others if missing. |
 | `systemd` (`busctl`) | Talks to GNOME Online Accounts over D-Bus. |
 | `libnotify` (`notify-send`) | Event notifications. Already part of Omarchy. |
 
@@ -63,7 +63,11 @@ configuration; enabling it in the bar goes through `omarchy plugin enable`,
 which is your action.
 
 Because the backend holds a Google access token while it runs, nothing on
-that path is resolved through `PATH`: it runs under `/usr/bin/python3` and
+that path is resolved through `PATH`, and nothing in the shell's environment
+can reach it: the panel runs it as `/usr/bin/python3 -I` (isolated mode —
+`PYTHON*` variables and the user site are ignored) with an explicit minimal
+environment of `HOME`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`
+only. It
 calls `/usr/bin/busctl`, `/usr/bin/notify-send`, `/usr/bin/xdg-open`,
 `/usr/bin/pacman` and Omarchy's own installer under `/usr/share/omarchy/bin`
 by absolute path. Every API response is capped at 8 MiB, every paginated
