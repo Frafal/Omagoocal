@@ -70,7 +70,14 @@ by absolute path. Every API response is capped at 8 MiB, every paginated
 listing at 20 pages / 5000 items, one sync at 10 000 events and 500
 calendars, and the backend's total output at 16 MiB. Remote strings are cut
 to Google's own field limits (title and location 1024, description 8192)
-and every field is coerced to the type the panel expects. The backend ends
+and every field is coerced to the type the panel expects. Those totals are enforced
+by one shared budget while the calendars are being fetched in parallel —
+bytes charged before a page is decoded, items as each page lands — and the
+first exhaustion cancels everything still queued, so the ceiling holds
+during the work rather than after it has all been held in memory. Output
+is encoded incrementally under the same kind of running count and framed
+in bounded lines, which the panel reads one at a time and cuts off, killing
+the helper, the moment its own ceiling is crossed. The backend ends
 itself after 120 seconds no matter what it is waiting on, and the panel
 kills any helper that outlives its own deadline. State files are only read
 if they are regular files owned by you with mode `0600`, opened

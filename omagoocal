@@ -31,7 +31,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +50,7 @@ MAX_ITEMS = 5000                       # ...and its aggregate size
 MAX_STATE_BYTES = 16 * 1024 * 1024     # one file in the state directory
 MAX_PAYLOAD_BYTES = 1024 * 1024         # one JSON document on stdin
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024     # everything this process will print
+OUTPUT_LINE_BYTES = 64 * 1024            # output is framed in lines this long
 MAX_BUSCTL_BYTES = 4 * 1024 * 1024      # one D-Bus reply from GOA
 DEADLINE_SECONDS = 120                  # then the process ends itself
 
@@ -61,6 +62,7 @@ MAX_DESCRIPTION = 8192
 MAX_SHORT = 512                         # ids, names, colours, links, emails
 MAX_TOTAL_EVENTS = 10000                # across every calendar in one sync
 MAX_TOTAL_CALENDARS = 500               # across every account
+MAX_SYNC_BYTES = 24 * 1024 * 1024       # raw response bytes across one whole sync
 
 STATE = os.path.expanduser("~/.local/state/omagoocal")
 _OLD_STATE = os.path.expanduser("~/.local/state/omarchy-gcal")
@@ -191,14 +193,28 @@ def load_config():
 def busctl(*args):
     """One D-Bus call, decoded. busctl ships with systemd; gdbus would need
     its GVariant output parsed by hand."""
-    out = subprocess.run([BUSCTL, "--user", "--json=short", *args],
-                         stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-    if out.returncode != 0:
-        detail = out.stderr.decode(errors="replace").strip().splitlines() or ["busctl failed"]
+    proc = subprocess.Popen([BUSCTL, "--user", "--json=short", *args],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    try:
+        # Read a bounded amount and no more; a reply past the cap is killed,
+        # not buffered.
+        raw = proc.stdout.read(MAX_BUSCTL_BYTES + 1)
+        if len(raw) > MAX_BUSCTL_BYTES:
+            proc.kill()
+            raise RuntimeError("D-Bus reply over %d MiB" % (MAX_BUSCTL_BYTES >> 20))
+        err = proc.stderr.read(4096)
+        rc = proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise RuntimeError("busctl did not finish")
+    finally:
+        proc.stdout.close()
+        proc.stderr.close()
+    if rc != 0:
+        detail = err.decode(errors="replace").strip().splitlines() or ["busctl failed"]
         raise RuntimeError(detail[-1][:400])
-    if len(out.stdout) > MAX_BUSCTL_BYTES:
-        raise RuntimeError("D-Bus reply over %d MiB" % (MAX_BUSCTL_BYTES >> 20))
-    return json.loads(out.stdout.decode(errors="replace") or "{}")
+    return json.loads(raw.decode(errors="replace") or "{}")
 
 
 _accounts_cache = None
@@ -256,6 +272,40 @@ def access_token(email):
                            "Reconnect it in Online Accounts. (%s)" % (email, exc))
 
 
+# ------------------------------------------------------------------- budget
+
+class BudgetExceeded(RuntimeError):
+    pass
+
+
+class Budget:
+    """A global allowance shared by every fetch thread of one operation.
+
+    Bytes are charged before a response is decoded and items as each page
+    lands, so the ceiling is enforced while work is happening — not after
+    every calendar has already been materialized. The first thread to
+    exhaust it flips `cancelled`; every other thread stops at its next
+    page boundary and the caller cancels whatever was still queued."""
+
+    def __init__(self, items, nbytes, what):
+        self.items, self.nbytes, self.what = items, nbytes, what
+        self.lock = threading.Lock()
+        self.cancelled = threading.Event()
+
+    def check(self):
+        if self.cancelled.is_set():
+            raise BudgetExceeded("%s: stopped after the budget was exhausted" % self.what)
+
+    def charge(self, items=0, nbytes=0):
+        with self.lock:
+            self.items -= items
+            self.nbytes -= nbytes
+            if self.items < 0 or self.nbytes < 0:
+                self.cancelled.set()
+                raise BudgetExceeded("%s budget exhausted (%s); remaining work cancelled"
+                                     % (self.what, "items" if self.items < 0 else "bytes"))
+
+
 # --------------------------------------------------------------------- http
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -272,9 +322,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect())
 
 
-def request(url, data=None, headers=None, method=None):
+def request(url, data=None, headers=None, method=None, budget=None):
     if not url.startswith(API + "/"):
         raise RuntimeError("Refusing request outside the Calendar API: " + url.split("?")[0])
+    if budget:
+        budget.check()
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, method=method,
                                  headers=headers or {})
@@ -287,10 +339,12 @@ def request(url, data=None, headers=None, method=None):
     if len(raw) > MAX_RESPONSE_BYTES:
         raise RuntimeError("Response over %d MiB from %s"
                            % (MAX_RESPONSE_BYTES >> 20, url.split("?")[0]))
+    if budget:
+        budget.charge(nbytes=len(raw))       # before decoding allocates again
     return json.loads(raw) if raw else {}
 
 
-def api(account, path, params=None, payload=None, method=None):
+def api(account, path, params=None, payload=None, method=None, budget=None):
     token = access_token(account)
     url = API + path
     if params:
@@ -298,17 +352,22 @@ def api(account, path, params=None, payload=None, method=None):
     headers = {"Authorization": "Bearer " + token}
     if payload is not None:
         headers["Content-Type"] = "application/json"
-    return request(url, data=payload, headers=headers, method=method)
+    return request(url, data=payload, headers=headers, method=method, budget=budget)
 
 
-def api_items(account, path, params):
+def api_items(account, path, params, budget=None):
     """Every item of a paginated list. A busy shared calendar clears 500
     events in two months; taking only the first page dropped the rest with
     no error anywhere."""
     items, params = [], dict(params)
     for _ in range(MAX_PAGES):
-        page = api(account, path, params)
-        items.extend(page.get("items", []))
+        page = api(account, path, params, budget=budget)
+        page_items = page.get("items", [])
+        if not isinstance(page_items, list):
+            page_items = []
+        if budget:
+            budget.charge(items=len(page_items))   # as each page lands
+        items.extend(page_items)
         if len(items) > MAX_ITEMS:
             raise RuntimeError("More than %d items from %s; refusing to keep going"
                                % (MAX_ITEMS, path))
@@ -349,12 +408,16 @@ def _cache_put(kind, email, value):
         _write(CACHE, cache)
 
 
-def _account_calendars(email, fresh=False):
+def _account_calendars(email, fresh=False, budget=None):
+    if budget:
+        budget.check()                       # a job that starts late does nothing
     cached = _cache_get("calendars", email, fresh)
     if cached is not None:
         return email, cached, None
     try:
-        items = api_items(email, "/users/me/calendarList", {"maxResults": 250})
+        items = api_items(email, "/users/me/calendarList", {"maxResults": 250}, budget)
+    except BudgetExceeded:
+        raise                                # never folded into a per-account error
     except RuntimeError as exc:
         return email, [], str(exc)
     _cache_put("calendars", email, items)
@@ -369,8 +432,9 @@ def calendar_list(fresh=False):
             access_token(email)
         except RuntimeError:
             pass
+    budget = Budget(MAX_TOTAL_CALENDARS, MAX_SYNC_BYTES // 4, "calendars")
     with ThreadPoolExecutor(max_workers=4) as pool:
-        fetched = list(pool.map(lambda e: _account_calendars(e, fresh), emails))
+        fetched = _gather(pool, [(_account_calendars, e, fresh, budget) for e in emails], budget)
 
     out = []
     for email, items, error in fetched:
@@ -396,22 +460,27 @@ def calendar_list(fresh=False):
     return out
 
 
-def event_palette(email, fresh=False):
+def event_palette(email, fresh=False, budget=None):
     cached = _cache_get("palette", email, fresh)
     if cached is not None:
         return cached
     try:
         palette = {_text(k, 16): _text(v.get("background"), 16)
-                   for k, v in api(email, "/colors")["event"].items()
+                   for k, v in api(email, "/colors", budget=budget)["event"].items()
                    if isinstance(k, str) and isinstance(v, dict)}
+    except BudgetExceeded:
+        raise
     except (RuntimeError, KeyError, AttributeError):
         return {}
     _cache_put("palette", email, palette)
     return palette
 
 
-def _fetch_calendar(cal, time_min, time_max):
-    """One calendar's events. Returns (calendar, items) or (calendar, error)."""
+def _fetch_calendar(cal, time_min, time_max, budget):
+    """One calendar's events. Returns (calendar, items) or (calendar, error).
+    A budget exhaustion is not an error for this calendar; it aborts the
+    whole sync and is re-raised untouched."""
+    budget.check()                           # a job that starts late does nothing
     try:
         items = api_items(cal["account"], "/calendars/%s/events"
                           % urllib.parse.quote(cal["id"], safe=""), {
@@ -420,10 +489,29 @@ def _fetch_calendar(cal, time_min, time_max):
                               "singleEvents": "true",   # expand recurrences
                               "orderBy": "startTime",
                               "maxResults": 2500,       # the API's ceiling
-                          })
+                          }, budget)
         return cal, items, None
+    except BudgetExceeded:
+        raise
     except RuntimeError as exc:
         return cal, [], str(exc)
+
+
+def _gather(pool, jobs, budget):
+    """Run (fn, *args) jobs on the pool and collect results as they finish.
+    The first BudgetExceeded cancels every job still queued; running ones
+    stop at their next page boundary because `budget.cancelled` is set."""
+    futures = [pool.submit(fn, *args) for fn, *args in jobs]
+    results = []
+    try:
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    except BudgetExceeded:
+        budget.cancelled.set()
+        for fut in futures:
+            fut.cancel()
+        raise
+    return results
 
 
 def events(time_min, time_max, calendars=None, fresh=False):
@@ -439,11 +527,13 @@ def events(time_min, time_max, calendars=None, fresh=False):
             pass
 
     # A dozen calendars fetched one after another is several seconds of empty
-    # grid. They are independent reads, so fetch them together.
+    # grid. They are independent reads, so fetch them together — under one
+    # budget, so the total across all of them is bounded while they run, not
+    # after they have all been held in memory.
+    budget = Budget(MAX_TOTAL_EVENTS, MAX_SYNC_BYTES, "events")
     with ThreadPoolExecutor(max_workers=8) as pool:
-        palettes = dict(zip(accounts, pool.map(lambda e: event_palette(e, fresh), accounts)))
-        fetched = list(pool.map(
-            lambda c: _fetch_calendar(c, time_min, time_max), active))
+        palettes = dict(zip(accounts, pool.map(lambda e: event_palette(e, fresh, budget), accounts)))
+        fetched = _gather(pool, [(_fetch_calendar, c, time_min, time_max, budget) for c in active], budget)
 
     out = []
     for cal, items, error in fetched:
@@ -622,13 +712,34 @@ def _deadline(signum, frame):
 
 
 def emit(result):
-    """The one place output is produced: one JSON document, or an error, and
-    never more than MAX_OUTPUT_BYTES of it."""
-    text = json.dumps(result)
-    if len(text) > MAX_OUTPUT_BYTES:
-        raise RuntimeError("Result over %d MiB; refusing to emit"
-                           % (MAX_OUTPUT_BYTES >> 20))
-    return text
+    """The one place output is produced: one JSON document, or an error.
+
+    Encoded incrementally with a running count, so the ceiling is reached —
+    and the result abandoned — before more than MAX_OUTPUT_BYTES of it has
+    ever been allocated; json.dumps would build the whole string first.
+
+    The text is framed into lines of about OUTPUT_LINE_BYTES, broken only
+    between encoder tokens. A newline between tokens is legal JSON, so a
+    shell user still gets one valid document — and the panel, which reads
+    line by line, can stop the process the moment its own ceiling is
+    crossed instead of buffering everything first. No single line can
+    exceed the frame by more than one token, and the largest token is a
+    description capped at MAX_DESCRIPTION."""
+    lines, line, total = [], [], 0
+    line_len = 0
+    for chunk in json.JSONEncoder(separators=(",", ":")).iterencode(result):
+        total += len(chunk)
+        if total > MAX_OUTPUT_BYTES:
+            raise RuntimeError("Result over %d MiB; refusing to emit"
+                               % (MAX_OUTPUT_BYTES >> 20))
+        line.append(chunk)
+        line_len += len(chunk)
+        if line_len >= OUTPUT_LINE_BYTES:
+            lines.append("".join(line))
+            line, line_len = [], 0
+    if line:
+        lines.append("".join(line))
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

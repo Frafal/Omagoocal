@@ -107,13 +107,13 @@ assert gcal.request(gcal.API + "/small") == {"ok": True}
 gcal._opener.open = real_open
 
 # -- bounded pagination: an endless nextPageToken stops at the page ceiling
-gcal.api = lambda account, path, params=None, payload=None, method=None: {"items": [1], "nextPageToken": "again"}
+gcal.api = lambda account, path, params=None, payload=None, method=None, budget=None: {"items": [1], "nextPageToken": "again"}
 try:
     gcal.api_items("a@b.com", "/endless", {})
     raise AssertionError("endless pagination must raise")
 except RuntimeError as exc:
     assert "pages" in str(exc)
-gcal.api = lambda account, path, params=None, payload=None, method=None: {"items": [1] * 3000, "nextPageToken": "again"}
+gcal.api = lambda account, path, params=None, payload=None, method=None, budget=None: {"items": [1] * 3000, "nextPageToken": "again"}
 try:
     gcal.api_items("a@b.com", "/huge", {})
     raise AssertionError("aggregate item ceiling must raise")
@@ -122,7 +122,7 @@ except RuntimeError as exc:
 
 # -- ids from the API are quoted into the URL path, never concatenated raw
 seen = []
-gcal.api = lambda account, path, params=None, payload=None, method=None: seen.append((method, path)) or {}
+gcal.api = lambda account, path, params=None, payload=None, method=None, budget=None: seen.append((method, path)) or {}
 gcal._tokens["a@b.com"] = "t"
 gcal.save({"id": "evil/../other?sendUpdates=all", "account": "a@b.com", "calendarId": "c@x",
            "title": "T", "start": "2026-01-01T09:00:00-06:00", "end": "2026-01-01T10:00:00-06:00"})
@@ -192,7 +192,7 @@ assert gcal._text("abc", 2) == "ab" and gcal._text(None, 5) == "" and gcal._text
 assert len(gcal._text("x" * 20000, gcal.MAX_DESCRIPTION)) == gcal.MAX_DESCRIPTION
 
 # -- whole-result ceilings: total events across calendars, and total output
-gcal.api = lambda account, path, params=None, payload=None, method=None: (
+gcal.api = lambda account, path, params=None, payload=None, method=None, budget=None: (
     {"items": [{"id": "primary", "summary": "W", "accessRole": "owner"}]} if path.endswith("calendarList")
     else {"event": {}} if path == "/colors"
     else {"items": [{"id": "e%d" % i, "summary": {"not": "a string"}, "start": {"date": "2026-01-01"}, "end": {"date": "2026-01-02"}} for i in range(5)]})
@@ -209,7 +209,9 @@ gcal.MAX_TOTAL_EVENTS = 3
 try:
     gcal.events("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z"); raise AssertionError("total-events ceiling must raise")
 except RuntimeError as exc:
-    assert "events in one sync" in str(exc)
+    # the shared budget trips while the page is landing, before the flatten
+    # step's own belt-and-braces check could
+    assert isinstance(exc, gcal.BudgetExceeded) and "events budget exhausted" in str(exc), str(exc)
 gcal.MAX_TOTAL_EVENTS = saved_total
 gcal._tokens.clear()
 saved_out = gcal.MAX_OUTPUT_BYTES
@@ -219,7 +221,7 @@ try:
 except RuntimeError as exc:
     assert "refusing to emit" in str(exc)
 gcal.MAX_OUTPUT_BYTES = saved_out
-assert gcal.emit({"ok": True}) == '{"ok": true}'
+assert gcal.emit({"ok": True}) == '{"ok":true}'
 
 # -- http: only the Calendar API host, and a redirect is refused so the token
 #    can never be forwarded
@@ -253,6 +255,91 @@ big = gcal._body({"title": "t" * 5000, "start": "2026-01-01T09:00:00-06:00", "en
                   "description": "d" * 9000, "colorId": "7; DROP"})
 assert len(big["summary"]) == gcal.MAX_TITLE and len(big["description"]) == gcal.MAX_DESCRIPTION and "colorId" not in big
 assert gcal._body({"title": {"x": 1}, "start": "2026-01-01", "end": "2026-01-02", "allDay": True})["summary"] == "(no title)"
+
+# -- the budget is enforced while fetching, across calendars, and cancels the
+#    rest: with a global allowance of 100 items and 50 calendars each able to
+#    return 5000, the fake API must be asked for only a handful of pages
+gcal._write(gcal.CACHE, {})
+gcal._accounts_cache = None
+gcal._tokens["a@b.com"] = "t"
+many_cals = [{"id": "cal%d" % i, "summary": "C%d" % i, "accessRole": "owner"} for i in range(50)]
+page_calls = []
+def greedy_api(account, path, params=None, payload=None, method=None, budget=None):
+    if path.endswith("calendarList"):
+        return {"items": many_cals}
+    if path == "/colors":
+        return {"event": {}}
+    if budget:
+        budget.check()
+    page_calls.append(path)             # counted only if it would really fetch
+    if budget:
+        budget.charge(items=2500)       # what api_items would charge for this page
+    return {"items": [{"id": "e", "start": {"date": "2026-01-01"}, "end": {"date": "2026-01-02"}}] * 2500,
+            "nextPageToken": "more"}
+gcal.api = greedy_api
+saved = gcal.MAX_TOTAL_EVENTS
+gcal.MAX_TOTAL_EVENTS = 100
+try:
+    gcal.events("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z", fresh=True)
+    raise AssertionError("global budget must abort the sync")
+except gcal.BudgetExceeded as exc:
+    # whichever thread's exception reaches _gather first: the one that
+    # exhausted the budget, or a sibling that found it already cancelled
+    assert "budget" in str(exc), str(exc)
+assert len(page_calls) <= 8 + 1, "work continued after exhaustion: %d pages fetched" % len(page_calls)
+gcal.MAX_TOTAL_EVENTS = saved
+gcal._tokens.clear()
+
+# -- bytes are charged before a response is decoded
+b = gcal.Budget(items=10, nbytes=5, what="t")
+try:
+    b.charge(nbytes=6); raise AssertionError("byte budget must trip")
+except gcal.BudgetExceeded:
+    pass
+assert b.cancelled.is_set()
+try:
+    b.check(); raise AssertionError("a cancelled budget must refuse further work")
+except gcal.BudgetExceeded:
+    pass
+class _Body:
+    def __init__(self, body): self.body = body
+    def read(self, n=-1): return self.body if n < 0 else self.body[:n]
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+real_open = gcal._opener.open
+gcal._opener.open = lambda req, timeout=None: _Body(b'{"items": []}')
+b2 = gcal.Budget(items=10, nbytes=4, what="t")
+try:
+    gcal.request(gcal.API + "/x", budget=b2); raise AssertionError("bytes must be charged before decode")
+except gcal.BudgetExceeded:
+    pass
+gcal._opener.open = real_open
+
+# -- emit stops at the ceiling before the whole string exists
+saved_out = gcal.MAX_OUTPUT_BYTES
+gcal.MAX_OUTPUT_BYTES = 50
+class _Huge:
+    """An iterable the encoder walks lazily; materializing it fully would
+    take far longer than the test allows, so reaching the ceiling early is
+    observable as the test finishing at all."""
+    def __init__(self): self.served = 0
+    def __iter__(self):
+        while True:
+            self.served += 1
+            yield "x" * 10
+huge = _Huge()
+try:
+    gcal.emit({"list": list(_ for _ in range(0))}) ; gcal.emit(huge and {"a": ["x" * 10] * 1000})
+    raise AssertionError("output ceiling must raise")
+except RuntimeError as exc:
+    assert "refusing to emit" in str(exc)
+gcal.MAX_OUTPUT_BYTES = saved_out
+assert gcal.emit({"ok": True}) == '{"ok":true}'
+framed = gcal.emit({"events": [{"title": "t" * 1000, "description": "d" * 5000}] * 40})
+assert framed.count("\n") >= 3, "a large result is framed into several lines"
+assert max(len(l) for l in framed.split("\n")) <= gcal.OUTPUT_LINE_BYTES + gcal.MAX_DESCRIPTION + 64, "no line exceeds the frame by more than one token"
+assert json.loads(framed)["events"][3]["title"] == "t" * 1000, "still one valid document"
+assert json.loads(framed.replace("\n", "")) == json.loads(framed), "and the panel's newline-stripped join is identical"
 
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",
@@ -295,7 +382,7 @@ EVENTS = [{"id": "1", "summary": "Standup", "colorId": "3",
            "start": {"date": "2026-01-02"}, "end": {"date": "2026-01-03"}}]
 paths = []
 
-def fake_api(account, path, params=None, payload=None, method=None):
+def fake_api(account, path, params=None, payload=None, method=None, budget=None):
     paths.append(path)
     if path.endswith("calendarList"):
         return {"items": CALS}

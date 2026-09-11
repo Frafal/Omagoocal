@@ -419,13 +419,14 @@ Panel {
   Process {
     id: snapshotProc
     command: [root.backend, "snapshot"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        if (root.everSynced) return
-        if (String(text || "").length > root.maxBackendOutput) return
+    stdout: BackendOutput { id: snapshotOut; proc: snapshotProc }
+    onStarted: snapshotOut.reset()
+    onExited: function(code) {
+      var text = snapshotOut.take()
+      if (root.everSynced || text === "") return
+      {
         try {
-          var snap = JSON.parse(String(text || "{}"))
+          var snap = JSON.parse(text)
           // Only if the saved window still covers the one we are about to
           // ask for; otherwise the fetch alone is the honest picture.
           if (snap.payload && Model.parseStamp(snap.timeMin) <= root.rangeStart()
@@ -481,38 +482,61 @@ Panel {
   // ceiling so a misbehaving helper can never fill the shell's memory.
   readonly property int maxBackendOutput: 20 * 1024 * 1024
 
+  // Backend output arrives line by line (the backend frames its JSON at
+  // token boundaries), and is counted as it arrives: past the ceiling the
+  // process is killed and what was buffered is dropped — never collected
+  // in full first, which is what StdioCollector would do.
+  component BackendOutput: SplitParser {
+    property var proc
+    property var lines: []
+    property int bytes: 0
+    property bool overflowed: false
+    onRead: function(data) {
+      if (overflowed) return
+      bytes += data.length
+      if (bytes > root.maxBackendOutput) {
+        overflowed = true
+        lines = []
+        if (proc && proc.running) proc.signal(9)
+        return
+      }
+      lines.push(data)
+    }
+    function take() {
+      var text = overflowed ? "" : lines.join("")
+      lines = []; bytes = 0; overflowed = false
+      return text
+    }
+    function reset() { lines = []; bytes = 0; overflowed = false }
+  }
+
   Process {
     id: syncProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.busy = false
-        if (String(text || "").length > root.maxBackendOutput) {
-          root.error = "Backend output exceeded the size limit."
-          return
-        }
-        try { root.applySync(JSON.parse(String(text || "{}"))) }
-        catch (e) { root.error = "Backend returned junk: " + String(text).substring(0, 120) }
-        root.checkNotifications()
-        if (root.syncQueued) { root.syncQueued = false; Qt.callLater(root.sync) }
-      }
+    stdout: BackendOutput { id: syncOut; proc: syncProc }
+    onStarted: syncOut.reset()
+    onExited: function(code) {
+      root.busy = false
+      if (syncOut.overflowed) { syncOut.take(); root.error = "Backend output exceeded the size limit."; return }
+      var text = syncOut.take()
+      if (code !== 0 && text === "") { root.error = "Backend exited with status " + code; return }
+      try { root.applySync(JSON.parse(text || "{}")) }
+      catch (e) { root.error = "Backend returned junk: " + text.substring(0, 120) }
+      root.checkNotifications()
+      if (root.syncQueued) { root.syncQueued = false; Qt.callLater(root.sync) }
     }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (String(text).trim() !== "") console.warn("omagoocal/sync", text)
-    }
-    onExited: function(code) { if (code !== 0) root.busy = false }
   }
 
   Process {
     id: statusProc
     command: [root.backend, "status"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        if (String(text || "").length > root.maxBackendOutput) return
+    stdout: BackendOutput { id: statusOut; proc: statusProc }
+    onStarted: statusOut.reset()
+    onExited: function(code) {
+      var text = statusOut.take()
+      if (text === "") return
+      {
         try {
-          var status = JSON.parse(String(text || "{}"))
+          var status = JSON.parse(text)
           root.cfg = status.config || {}
           root.accounts = status.accounts || []
           root.view = root.connected ? (root.cfg.defaultView || "week") : "settings"
@@ -529,20 +553,17 @@ Panel {
     property var pending: null
     property string payload: ""
     stdinEnabled: true
-    onStarted: { write(payload + "\n"); payload = "" }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.busy = false
-        var result = {}
-        if (String(text || "").length > root.maxBackendOutput) result = { error: "Backend output exceeded the size limit." }
-        else try { result = JSON.parse(String(text || "{}")) } catch (e) {}
-        if (result.error) root.error = result.error
-        else if (mutateProc.pending) mutateProc.pending()
-        mutateProc.pending = null
-      }
+    stdout: BackendOutput { id: mutateOut; proc: mutateProc }
+    onStarted: { mutateOut.reset(); write(payload + "\n"); payload = "" }
+    onExited: function(code) {
+      root.busy = false
+      var result = {}
+      if (mutateOut.overflowed) { mutateOut.take(); result = { error: "Backend output exceeded the size limit." } }
+      else try { result = JSON.parse(mutateOut.take() || "{}") } catch (e) { result = { error: "Backend returned junk." } }
+      if (result.error) root.error = result.error
+      else if (mutateProc.pending) mutateProc.pending()
+      mutateProc.pending = null
     }
-    onExited: function(code) { if (code !== 0) root.busy = false }
   }
 
   Process {
@@ -613,13 +634,12 @@ Panel {
   Process {
     id: loginProc
     command: [root.backend, "login"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var result = {}
-        try { result = JSON.parse(String(text || "{}")) } catch (e) {}
-        if (result.error) root.error = result.error
-      }
+    stdout: BackendOutput { id: loginOut; proc: loginProc }
+    onStarted: loginOut.reset()
+    onExited: function(code) {
+      var result = {}
+      try { result = JSON.parse(loginOut.take() || "{}") } catch (e) {}
+      if (result.error) root.error = result.error
     }
   }
 
