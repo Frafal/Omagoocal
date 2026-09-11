@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Google Calendar backend for Omagoocal, the Omarchy shell plugin.
+
+Stdlib only, on purpose: this runs inside a desktop shell that should not
+carry a pip tree.
+
+Auth is brokered by GNOME Online Accounts, the same stack GNOME Calendar
+uses. That is what makes this plugin shippable: GOA carries the distro's own
+Google OAuth client, so nobody has to create a Google Cloud project, and the
+plugin never has to pass Google's verification review or live under the
+100-user cap an unverified client gets. GOA also owns the refresh loop, the
+token storage and the multi-account list, so none of that is written here.
+
+Talking to GOA goes through `busctl --json`, so there is no python-gobject
+dependency either. Every subcommand prints one JSON document on stdout.
+"""
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = "https://www.googleapis.com/calendar/v3"
+GOA = "org.gnome.OnlineAccounts"
+GOA_ROOT = "/org/gnome/OnlineAccounts"
+
+STATE = os.path.expanduser("~/.local/state/omagoocal")
+_OLD_STATE = os.path.expanduser("~/.local/state/omarchy-gcal")
+if os.path.isdir(_OLD_STATE) and not os.path.exists(STATE):
+    os.rename(_OLD_STATE, STATE)             # pre-rename builds kept prefs here
+CONFIG = os.path.join(STATE, "config.json")
+CACHE = os.path.join(STATE, "cache.json")        # calendar lists + palettes, TTL
+LAST_SYNC = os.path.join(STATE, "last-sync.json")  # the panel paints this at startup
+CACHE_TTL = 3600                                 # calendars change rarely
+
+DEFAULTS = {
+    "calendars": {},        # "email\tcalendarId" -> bool (absent = enabled)
+    "notifyMinutes": 10,
+    "defaultView": "week",
+    "weekStart": 1,         # 0 Sunday, 1 Monday
+    "hours12": False,
+    "dayStartHour": 7,
+    "refreshMinutes": 5,
+}
+
+
+# ------------------------------------------------------------------ storage
+
+def _read(path, fallback):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return fallback
+
+
+def _write(path, data):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.chmod(tmp, 0o600)          # refresh tokens live here
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    cfg.update(_read(CONFIG, {}))
+    return cfg
+
+
+# ------------------------------------------------------------------- goa
+
+def busctl(*args):
+    """One D-Bus call, decoded. busctl ships with systemd; gdbus would need
+    its GVariant output parsed by hand."""
+    out = subprocess.run(["busctl", "--user", "--json=short", *args],
+                         capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        raise RuntimeError((out.stderr or "busctl failed").strip().splitlines()[-1])
+    return json.loads(out.stdout or "{}")
+
+
+_accounts_cache = None
+
+
+def goa_accounts():
+    """Every Google account GOA holds with its calendar feature switched on,
+    as {email: object path}. Cached for the run — a subprocess is short-lived
+    and this is consulted from several places."""
+    global _accounts_cache
+    if _accounts_cache is not None:
+        return _accounts_cache
+    try:
+        managed = busctl("call", GOA, GOA_ROOT,
+                         "org.freedesktop.DBus.ObjectManager",
+                         "GetManagedObjects")["data"][0]
+    except Exception:
+        return {}
+
+    found = {}
+    for path, interfaces in managed.items():
+        account = interfaces.get(GOA + ".Account")
+        if not account:
+            continue
+        if account.get("ProviderType", {}).get("data") != "google":
+            continue
+        if account.get("CalendarDisabled", {}).get("data") is True:
+            continue
+        email = (account.get("PresentationIdentity", {}).get("data")
+                 or account.get("Identity", {}).get("data") or path)
+        found[email] = path
+    _accounts_cache = found
+    return found
+
+
+# One token per account per run. Without this every calendar fetch spawns its
+# own busctl and asks GOA to hand the token over again — fourteen calendars
+# meant fourteen round trips before a single event was read.
+_tokens = {}
+
+
+def access_token(email):
+    if email in _tokens:
+        return _tokens[email]
+    paths = goa_accounts()
+    if email not in paths:
+        raise RuntimeError("Not connected: " + email)
+    try:
+        result = busctl("call", GOA, paths[email],
+                        GOA + ".OAuth2Based", "GetAccessToken")
+        _tokens[email] = result["data"][0]
+        return _tokens[email]
+    except RuntimeError as exc:
+        raise RuntimeError("GNOME Online Accounts could not refresh %s. "
+                           "Reconnect it in Online Accounts. (%s)" % (email, exc))
+
+
+# --------------------------------------------------------------------- http
+
+def request(url, data=None, headers=None, method=None):
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:400]
+        raise RuntimeError("%s %s: %s" % (exc.code, url.split("?")[0], detail))
+
+
+def api(account, path, params=None, payload=None, method=None):
+    token = access_token(account)
+    url = API + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    headers = {"Authorization": "Bearer " + token}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    return request(url, data=payload, headers=headers, method=method)
+
+
+def api_items(account, path, params):
+    """Every item of a paginated list. A busy shared calendar clears 500
+    events in two months; taking only the first page dropped the rest with
+    no error anywhere."""
+    items, params = [], dict(params)
+    while True:
+        page = api(account, path, params)
+        items.extend(page.get("items", []))
+        token = page.get("nextPageToken")
+        if not token:
+            return items
+        params["pageToken"] = token
+
+
+# ------------------------------------------------------------------ calendar
+
+def _cache_get(kind, email, fresh):
+    entry = _read(CACHE, {}).get(kind, {}).get(email)
+    if fresh or not entry or time.time() - entry.get("at", 0) > CACHE_TTL:
+        return None
+    return entry["value"]
+
+
+_cache_lock = threading.Lock()
+
+
+def _cache_put(kind, email, value):
+    # Called from the fetch pool. Two threads doing read-modify-write on the
+    # same file lose entries, and both racing os.replace on one .tmp name is
+    # a FileNotFoundError for whichever finishes second.
+    with _cache_lock:
+        cache = _read(CACHE, {})
+        cache.setdefault(kind, {})[email] = {"at": time.time(), "value": value}
+        _write(CACHE, cache)
+
+
+def _account_calendars(email, fresh=False):
+    cached = _cache_get("calendars", email, fresh)
+    if cached is not None:
+        return email, cached, None
+    try:
+        items = api_items(email, "/users/me/calendarList", {"maxResults": 250})
+    except RuntimeError as exc:
+        return email, [], str(exc)
+    _cache_put("calendars", email, items)
+    return email, items, None
+
+
+def calendar_list(fresh=False):
+    cfg = load_config()
+    emails = sorted(goa_accounts())
+    for email in emails:                     # warm tokens before threading
+        try:
+            access_token(email)
+        except RuntimeError:
+            pass
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fetched = list(pool.map(lambda e: _account_calendars(e, fresh), emails))
+
+    out = []
+    for email, items, error in fetched:
+        if error:
+            out.append({"account": email, "error": error})
+            continue
+        for cal in items:
+            key = email + "\t" + cal["id"]
+            out.append({
+                "account": email,
+                "id": cal["id"],
+                "name": cal.get("summaryOverride") or cal.get("summary", cal["id"]),
+                "color": cal.get("backgroundColor", "#9fc6e7"),
+                "primary": cal.get("primary", False),
+                "writable": cal.get("accessRole") in ("owner", "writer"),
+                "enabled": cfg["calendars"].get(key, True),
+            })
+    return out
+
+
+def event_palette(email, fresh=False):
+    cached = _cache_get("palette", email, fresh)
+    if cached is not None:
+        return cached
+    try:
+        palette = {k: v["background"] for k, v in api(email, "/colors")["event"].items()}
+    except (RuntimeError, KeyError):
+        return {}
+    _cache_put("palette", email, palette)
+    return palette
+
+
+def _fetch_calendar(cal, time_min, time_max):
+    """One calendar's events. Returns (calendar, items) or (calendar, error)."""
+    try:
+        items = api_items(cal["account"], "/calendars/%s/events"
+                          % urllib.parse.quote(cal["id"], safe=""), {
+                              "timeMin": time_min,
+                              "timeMax": time_max,
+                              "singleEvents": "true",   # expand recurrences
+                              "orderBy": "startTime",
+                              "maxResults": 2500,       # the API's ceiling
+                          })
+        return cal, items, None
+    except RuntimeError as exc:
+        return cal, [], str(exc)
+
+
+def events(time_min, time_max, calendars=None, fresh=False):
+    active = [c for c in (calendar_list(fresh) if calendars is None else calendars)
+              if not c.get("error") and c["enabled"]]
+    accounts = sorted({c["account"] for c in active})
+
+    # Warm the token cache serially so the threads below never race on it.
+    for email in accounts:
+        try:
+            access_token(email)
+        except RuntimeError:
+            pass
+
+    # A dozen calendars fetched one after another is several seconds of empty
+    # grid. They are independent reads, so fetch them together.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        palettes = dict(zip(accounts, pool.map(lambda e: event_palette(e, fresh), accounts)))
+        fetched = list(pool.map(
+            lambda c: _fetch_calendar(c, time_min, time_max), active))
+
+    out = []
+    for cal, items, error in fetched:
+        if error:
+            out.append({"error": error, "calendar": cal["name"]})
+            continue
+        palette = palettes.get(cal["account"], {})
+        for ev in items:
+            if ev.get("status") == "cancelled":
+                continue
+            start, end = ev.get("start", {}), ev.get("end", {})
+            out.append({
+                "id": ev["id"],
+                "account": cal["account"],
+                "calendarId": cal["id"],
+                "calendarName": cal["name"],
+                "title": ev.get("summary", "(no title)"),
+                "start": start.get("dateTime") or start.get("date", ""),
+                "end": end.get("dateTime") or end.get("date", ""),
+                "allDay": "date" in start,
+                # Event colour wins over calendar colour, which is what Google
+                # itself shows: a per-event colour is an explicit override.
+                "color": palette.get(ev.get("colorId", ""), cal["color"]),
+                "location": ev.get("location", ""),
+                "description": ev.get("description", ""),
+                "link": ev.get("htmlLink", ""),
+                "writable": cal["writable"],
+                "recurring": bool(ev.get("recurringEventId")),
+            })
+    return out
+
+
+def _body(args):
+    payload = {"summary": args["title"]}
+    if args.get("allDay"):
+        payload["start"] = {"date": args["start"]}
+        payload["end"] = {"date": args["end"]}
+    else:
+        payload["start"] = {"dateTime": args["start"]}
+        payload["end"] = {"dateTime": args["end"]}
+    for key in ("location", "description"):
+        if args.get(key):
+            payload[key] = args[key]
+    if args.get("colorId"):
+        payload["colorId"] = str(args["colorId"])
+    return payload
+
+
+def save(args):
+    path = "/calendars/%s/events" % urllib.parse.quote(args["calendarId"], safe="")
+    if args.get("id"):
+        return api(args["account"], path + "/" + args["id"],
+                   payload=_body(args), method="PATCH")
+    return api(args["account"], path, payload=_body(args), method="POST")
+
+
+def delete(args):
+    api(args["account"],
+        "/calendars/%s/events/%s" % (urllib.parse.quote(args["calendarId"], safe=""),
+                                     args["id"]),
+        method="DELETE")
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------- dispatch
+
+def account_chooser():
+    """The GOA account window, if one is installed. gnome-online-accounts-gtk
+    is the small standalone panel; control-center is the fallback for anyone
+    who already has GNOME."""
+    for argv in (["gnome-online-accounts-gtk"],
+                 ["gnome-control-center", "online-accounts"]):
+        if subprocess.run(["which", argv[0]], capture_output=True).returncode == 0:
+            return argv
+    return None
+
+
+
+def main(argv):
+    cmd = argv[0] if argv else "status"
+    cfg = load_config()
+
+    if cmd == "status":
+        return {"accounts": sorted(goa_accounts()), "config": cfg}
+    if cmd == "login":
+        # GOA owns the sign-in window; this just opens it. Google's own
+        # consent screen appears inside it.
+        chooser = account_chooser()
+        if not chooser:
+            raise RuntimeError("Install gnome-online-accounts-gtk to add an account.")
+        subprocess.Popen(chooser, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _write(CACHE, {})                    # whatever comes back is new
+        return {"ok": True}
+    if cmd == "sync":                      # sync <timeMin> <timeMax> [fresh]
+        # One call per refresh. The panel needs all three together and every
+        # one of them already walks the calendar list.
+        fresh = len(argv) > 3 and argv[3] == "fresh"
+        status = main(["status"])
+        payload = {"status": status, "calendars": [], "events": []}
+        if status["accounts"]:
+            # Fetched once and handed on: events() would otherwise pull the
+            # whole calendar list a second time.
+            payload["calendars"] = calendar_list(fresh)
+            payload["events"] = events(argv[1], argv[2], payload["calendars"], fresh)
+            # Kept so the panel can paint the last known week the instant the
+            # shell starts, before this process has even been spawned.
+            _write(LAST_SYNC, {"timeMin": argv[1], "timeMax": argv[2],
+                               "payload": payload})
+        return payload
+    if cmd == "setall":
+        # The panel owns the whole config while it is open, so it writes the
+        # whole thing. Last write wins, which is what a settings page means.
+        cfg.update(json.loads(base64.b64decode(argv[1])))
+        _write(CONFIG, cfg)
+        return {"ok": True}
+    if cmd in ("save", "delete"):
+        # Base64 argv rather than stdin: the caller is QML, where spawning a
+        # process with an argument is trivial and feeding it stdin is not.
+        args = json.loads(base64.b64decode(argv[1]))
+        return save(args) if cmd == "save" else delete(args)
+    raise RuntimeError("Unknown command: " + cmd)
+
+
+if __name__ == "__main__":
+    try:
+        print(json.dumps(main(sys.argv[1:])))
+    except Exception as exc:                       # one error shape for the UI
+        print(json.dumps({"error": str(exc)}))
+        sys.exit(1)

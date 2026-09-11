@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.huligabuliga.omagoocal",
+  "name": "Omagoocal",
+  "version": "1.0.0",
+  "author": "Jonas Clausen",
+  "license": "MIT",
+  "description": "Google Calendar in the bar: day, week and month views, multiple accounts, event editing, and notifications before events start.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Omagoocal",
+    "description": "Next event in the bar, full calendar in the popup. Left = calendar, right = refresh, middle = new event.",
+    "category": "Time",
+    "aliases": ["gcal", "omagoocal"],
+    "allowMultiple": false,
+    "defaults": { "showNextEvent": true }
+  }
+}
