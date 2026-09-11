@@ -17,6 +17,46 @@ gcal.CONFIG = os.path.join(gcal.STATE, "config.json")
 gcal.CACHE = os.path.join(gcal.STATE, "cache.json")
 gcal.LAST_SYNC = os.path.join(gcal.STATE, "last-sync.json")
 
+# -- Nothing below may reach D-Bus or the network. Both seams are stubbed
+#    before any code path can use them; individual tests swap in richer fakes.
+MANAGED = {"data": [{
+    "/org/gnome/OnlineAccounts/Accounts/account_1": {
+        "org.gnome.OnlineAccounts.Account": {
+            "ProviderType": {"data": "google"},
+            "PresentationIdentity": {"data": "a@b.com"},
+            "Identity": {"data": "a@b.com"},
+            "CalendarDisabled": {"data": False}}},
+    "/org/gnome/OnlineAccounts/Accounts/account_2": {
+        "org.gnome.OnlineAccounts.Account": {
+            "ProviderType": {"data": "google"},
+            "PresentationIdentity": {"data": "muted@b.com"},
+            "CalendarDisabled": {"data": True}}},
+    "/org/gnome/OnlineAccounts/Accounts/account_3": {
+        "org.gnome.OnlineAccounts.Account": {
+            "ProviderType": {"data": "imap_smtp"},
+            "PresentationIdentity": {"data": "mail@b.com"},
+            "CalendarDisabled": {"data": False}}},
+    "/org/gnome/OnlineAccounts/Manager": {
+        "org.gnome.OnlineAccounts.Manager": {}},
+}]}
+calls = []
+
+def fake_busctl(*args):
+    calls.append(args)
+    if args[-1] == "GetManagedObjects":
+        return MANAGED
+    if args[-1] == "GetAccessToken":
+        return {"data": ["ya29.token", 3599]}
+    return {}
+
+def unstubbed_api(*a, **k):
+    raise AssertionError("api() reached before this test stubbed it — would have hit the network")
+
+gcal.busctl = fake_busctl
+gcal.api = unstubbed_api
+gcal._accounts_cache = None
+gcal._tokens.clear()
+
 # -- config round-trip keeps defaults for untouched keys, and is chmod 600
 gcal._write(gcal.CONFIG, {"notifyMinutes": 30})
 assert gcal.load_config()["notifyMinutes"] == 30
@@ -157,8 +197,13 @@ gcal.api = lambda account, path, params=None, payload=None, method=None: (
     else {"event": {}} if path == "/colors"
     else {"items": [{"id": "e%d" % i, "summary": {"not": "a string"}, "start": {"date": "2026-01-01"}, "end": {"date": "2026-01-02"}} for i in range(5)]})
 gcal._tokens["a@b.com"] = "t"
-coerced = gcal.events("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z")
-assert [e["title"] for e in coerced] == ["(no title)"] * 5, "non-string summary becomes the placeholder"
+gcal._accounts_cache = None
+coerced = gcal.events("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z", fresh=True)
+# the fake returns five events per enabled calendar; every title must be the
+# placeholder, whatever the calendar count
+assert coerced and all(e["title"] == "(no title)" for e in coerced), \
+    "non-string summary becomes the placeholder: " + repr([e["title"] for e in coerced][:3])
+assert all(isinstance(e["description"], str) and isinstance(e["link"], str) for e in coerced)
 saved_total = gcal.MAX_TOTAL_EVENTS
 gcal.MAX_TOTAL_EVENTS = 3
 try:
@@ -218,38 +263,7 @@ allday = gcal._body({"title": "T", "allDay": True,
 assert allday["start"] == {"date": "2026-01-01"} and allday["colorId"] == "5"
 
 # -- GOA account discovery: only Google accounts, only with calendar enabled
-MANAGED = {"data": [{
-    "/org/gnome/OnlineAccounts/Accounts/account_1": {
-        "org.gnome.OnlineAccounts.Account": {
-            "ProviderType": {"data": "google"},
-            "PresentationIdentity": {"data": "a@b.com"},
-            "Identity": {"data": "a@b.com"},
-            "CalendarDisabled": {"data": False}}},
-    "/org/gnome/OnlineAccounts/Accounts/account_2": {
-        "org.gnome.OnlineAccounts.Account": {
-            "ProviderType": {"data": "google"},
-            "PresentationIdentity": {"data": "muted@b.com"},
-            "CalendarDisabled": {"data": True}}},
-    "/org/gnome/OnlineAccounts/Accounts/account_3": {
-        "org.gnome.OnlineAccounts.Account": {
-            "ProviderType": {"data": "imap_smtp"},
-            "PresentationIdentity": {"data": "mail@b.com"},
-            "CalendarDisabled": {"data": False}}},
-    "/org/gnome/OnlineAccounts/Manager": {
-        "org.gnome.OnlineAccounts.Manager": {}},
-}]}
-
-calls = []
-
-def fake_busctl(*args):
-    calls.append(args)
-    if args[-1] == "GetManagedObjects":
-        return MANAGED
-    if args[-1] == "GetAccessToken":
-        return {"data": ["ya29.token", 3599]}
-    return {}
-
-gcal.busctl = fake_busctl
+gcal._accounts_cache = None
 found = gcal.goa_accounts()
 assert list(found) == ["a@b.com"], found
 assert found["a@b.com"].endswith("account_1")
@@ -261,7 +275,12 @@ except RuntimeError as exc:
     assert "Not connected" in str(exc)
 
 # -- events(): disabled calendars are skipped, event colour beats calendar
-#    colour, cancelled events drop out, all-day is detected from `date`
+#    colour, cancelled events drop out, all-day is detected from `date`.
+#    Starts from an empty TTL cache: this test exercises fetch-then-cache
+#    itself, and earlier tests left their own entries on disk.
+gcal._write(gcal.CACHE, {})
+gcal._accounts_cache = None
+gcal._tokens.clear()
 gcal._write(gcal.CONFIG, {"calendars": {"a@b.com\tmuted": False}})
 CALS = [{"id": "primary", "summary": "Work", "backgroundColor": "#111111",
          "accessRole": "owner", "primary": True},
@@ -308,4 +327,5 @@ assert sum(1 for p in again if p.endswith("/events")) == 2, "events are never ca
 gcal.events("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z", fresh=True)
 assert any(p.endswith("calendarList") for p in paths[before + 2:]), "fresh bypasses the cache"
 
+assert all(a[0] != "call" or a[1] == gcal.GOA for a in calls), "only GOA was ever addressed"
 print("all checks passed")
