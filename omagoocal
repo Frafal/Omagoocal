@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Google Calendar backend for Omagoocal, the Omarchy shell plugin.
 
 Stdlib only, on purpose: this runs inside a desktop shell that should not
@@ -13,13 +13,21 @@ token storage and the multi-account list, so none of that is written here.
 
 Talking to GOA goes through `busctl --json`, so there is no python-gobject
 dependency either. Every subcommand prints one JSON document on stdout.
+
+This process holds a Google OAuth access token while it runs, so nothing on
+the way to it is looked up through PATH: the interpreter, busctl and the GOA
+account window are all fixed absolute paths, state lives in a directory that
+is checked to be ours and private before every read or write, and every
+network response and page walk has a ceiling.
 """
 
 import base64
 import json
 import os
 import subprocess
+import stat
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,9 +39,19 @@ API = "https://www.googleapis.com/calendar/v3"
 GOA = "org.gnome.OnlineAccounts"
 GOA_ROOT = "/org/gnome/OnlineAccounts"
 
+BUSCTL = "/usr/bin/busctl"
+ACCOUNT_CHOOSERS = (["/usr/bin/gnome-online-accounts-gtk"],
+                    ["/usr/bin/gnome-control-center", "online-accounts"])
+
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024   # one API response
+MAX_PAGES = 20                         # one paginated listing
+MAX_ITEMS = 5000                       # ...and its aggregate size
+MAX_STATE_BYTES = 16 * 1024 * 1024     # one file in the state directory
+
 STATE = os.path.expanduser("~/.local/state/omagoocal")
 _OLD_STATE = os.path.expanduser("~/.local/state/omarchy-gcal")
-if os.path.isdir(_OLD_STATE) and not os.path.exists(STATE):
+if (os.path.isdir(_OLD_STATE) and not os.path.islink(_OLD_STATE)
+        and not os.path.lexists(STATE)):
     os.rename(_OLD_STATE, STATE)             # pre-rename builds kept prefs here
 CONFIG = os.path.join(STATE, "config.json")
 CACHE = os.path.join(STATE, "cache.json")        # calendar lists + palettes, TTL
@@ -53,21 +71,70 @@ DEFAULTS = {
 
 # ------------------------------------------------------------------ storage
 
+_state_cache = None
+
+
+def _state_fd():
+    """A descriptor for the state directory, validated once per run.
+
+    Opened O_NOFOLLOW so a symlink planted at the path is refused rather than
+    followed; then checked to be a directory we own that nobody else can
+    write to. Every state read and write below is relative to this fd."""
+    global _state_cache
+    if _state_cache is not None:
+        return _state_cache
+    if not os.path.lexists(STATE):
+        os.makedirs(STATE, mode=0o700)
+    fd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    st = os.fstat(fd)
+    if st.st_uid != os.getuid():
+        os.close(fd)
+        raise RuntimeError("Refusing state directory not owned by us: " + STATE)
+    if st.st_mode & 0o077:
+        os.fchmod(fd, 0o700)
+    _state_cache = fd
+    return fd
+
+
 def _read(path, fallback):
     try:
-        with open(path) as fh:
-            return json.load(fh)
+        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW,
+                     dir_fd=_state_fd())
+    except OSError:
+        return fallback
+    try:
+        with os.fdopen(fd) as fh:
+            text = fh.read(MAX_STATE_BYTES + 1)
+        if len(text) > MAX_STATE_BYTES:
+            return fallback
+        return json.loads(text)
     except (OSError, ValueError):
         return fallback
 
 
 def _write(path, data):
-    os.makedirs(STATE, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(data, fh, indent=2)
-    os.chmod(tmp, 0o600)          # refresh tokens live here
-    os.replace(tmp, path)
+    """Atomic replace via a random, exclusively created temp file in the
+    validated directory. The destination is never a symlink we follow."""
+    dfd = _state_fd()
+    name = os.path.basename(path)
+    fd, tmp = tempfile.mkstemp(prefix=".", suffix=".tmp", dir=STATE)  # 0600, O_EXCL
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            if stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode):
+                raise RuntimeError("Refusing to write through a symlink: " + name)
+        except FileNotFoundError:
+            pass
+        os.replace(os.path.basename(tmp), name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_config():
@@ -81,7 +148,7 @@ def load_config():
 def busctl(*args):
     """One D-Bus call, decoded. busctl ships with systemd; gdbus would need
     its GVariant output parsed by hand."""
-    out = subprocess.run(["busctl", "--user", "--json=short", *args],
+    out = subprocess.run([BUSCTL, "--user", "--json=short", *args],
                          capture_output=True, text=True, timeout=120)
     if out.returncode != 0:
         raise RuntimeError((out.stderr or "busctl failed").strip().splitlines()[-1])
@@ -151,11 +218,14 @@ def request(url, data=None, headers=None, method=None):
                                  headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:400]
+        detail = exc.read(4096).decode(errors="replace")[:400]
         raise RuntimeError("%s %s: %s" % (exc.code, url.split("?")[0], detail))
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise RuntimeError("Response over %d MiB from %s"
+                           % (MAX_RESPONSE_BYTES >> 20, url.split("?")[0]))
+    return json.loads(raw) if raw else {}
 
 
 def api(account, path, params=None, payload=None, method=None):
@@ -174,13 +244,18 @@ def api_items(account, path, params):
     events in two months; taking only the first page dropped the rest with
     no error anywhere."""
     items, params = [], dict(params)
-    while True:
+    for _ in range(MAX_PAGES):
         page = api(account, path, params)
         items.extend(page.get("items", []))
+        if len(items) > MAX_ITEMS:
+            raise RuntimeError("More than %d items from %s; refusing to keep going"
+                               % (MAX_ITEMS, path))
         token = page.get("nextPageToken")
         if not token:
             return items
         params["pageToken"] = token
+    raise RuntimeError("More than %d pages from %s; refusing to keep going"
+                       % (MAX_PAGES, path))
 
 
 # ------------------------------------------------------------------ calendar
@@ -362,10 +437,9 @@ def delete(args):
 def account_chooser():
     """The GOA account window, if one is installed. gnome-online-accounts-gtk
     is the small standalone panel; control-center is the fallback for anyone
-    who already has GNOME."""
-    for argv in (["gnome-online-accounts-gtk"],
-                 ["gnome-control-center", "online-accounts"]):
-        if subprocess.run(["which", argv[0]], capture_output=True).returncode == 0:
+    who already has GNOME. Absolute paths only — no PATH lookup."""
+    for argv in ACCOUNT_CHOOSERS:
+        if os.access(argv[0], os.X_OK):
             return argv
     return None
 
@@ -383,7 +457,8 @@ def main(argv):
         chooser = account_chooser()
         if not chooser:
             raise RuntimeError("Install gnome-online-accounts-gtk to add an account.")
-        subprocess.Popen(chooser, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(chooser, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _write(CACHE, {})                    # whatever comes back is new
         return {"ok": True}
     if cmd == "sync":                      # sync <timeMin> <timeMax> [fresh]

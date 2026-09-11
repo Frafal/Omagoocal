@@ -45,36 +45,35 @@ Panel {
   //      client, so no user ever creates a Google Cloud project and the
   //      plugin never needs Google's verification review.
   //
-  //      The install follows the Omarchy convention: a visible floating
-  //      terminal (which is also where the sudo prompt can be answered), a
-  //      failure marker in XDG_RUNTIME_DIR, and a poll until it lands.
+  //      The install follows the Omarchy convention: Omarchy's own installer
+  //      in a visible floating terminal (which is also where its password
+  //      prompt is answered), then a poll of pacman until the packages land.
+  //
+  //      Every executable here is an absolute path and no shell of ours is
+  //      involved: the probe is pacman itself, and the install hands the
+  //      terminal wrapper one fixed command.
   property bool depsInstalled: false
   property bool depsChecking: true
   property bool installing: false
   property string installError: ""
 
   readonly property var requiredPackages: ["gnome-online-accounts", "gnome-online-accounts-gtk"]
-  readonly property string installFailurePath:
-    String(Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omagoocal-install.failed"
+  readonly property string pacman: "/usr/bin/pacman"
+  readonly property string omarchyBin: "/usr/share/omarchy/bin"
 
   function checkDeps() {
     if (depsProc.running) return
     depsChecking = true
-    depsProc.command = ["sh", "-c",
-      "if pacman -Q " + requiredPackages.join(" ") + " >/dev/null 2>&1; then exit 0; "
-      + "elif test -f \"$1\"; then cat \"$1\"; exit 2; else exit 1; fi",
-      "sh", installFailurePath]
+    depsProc.command = [pacman, "-Q"].concat(requiredPackages)
     depsProc.running = true
   }
 
   function installDeps() {
     installing = true
     installError = ""
-    installProc.command = ["omarchy", "launch", "floating", "terminal", "with", "presentation",
-      "rm -f \"$XDG_RUNTIME_DIR/omagoocal-install.failed\"; status=0; "
-      + "omarchy pkg add " + requiredPackages.join(" ") + " || status=$?; "
-      + "if (( status != 0 )); then printf '%s\\n' \"$status\" "
-      + "> \"$XDG_RUNTIME_DIR/omagoocal-install.failed\"; fi; (exit \"$status\")"]
+    installProc.command = [
+      omarchyBin + "/omarchy-launch-floating-terminal-with-presentation",
+      omarchyBin + "/omarchy-pkg-add " + requiredPackages.join(" ")]
     installProc.startDetached()
     installPoll.restart()
     installTimeout.restart()
@@ -371,7 +370,7 @@ Panel {
     for (var i = 0; i < due.length; i++) {
       var ev = due[i]
       fired[ev.id] = true
-      Quickshell.execDetached(["notify-send", "-a", "Calendar", "-u", "normal",
+      Quickshell.execDetached(["/usr/bin/notify-send", "-a", "Calendar", "-u", "normal",
         "-t", "12000", "-i", "office-calendar",
         ev.title,
         Model.relative(ev.startAt, now) + " · " + Model.rangeLabel(ev, hours12)
@@ -510,24 +509,15 @@ Panel {
 
   Process {
     id: depsProc
-    stdout: StdioCollector { waitForEnd: true }
     onExited: function(code) {
       root.depsChecking = false
       root.depsInstalled = code === 0
-      if (code === 0) {
-        root.installing = false
-        installPoll.stop()
-        installTimeout.stop()
-        root.loadedKey = ""
-        root.ensureRange()
-      } else if (code === 2 && root.installing) {
-        root.installing = false
-        installPoll.stop()
-        installTimeout.stop()
-        root.installError = String(depsProc.stdout.text).trim() === "130"
-          ? "Installation was cancelled."
-          : "Installation did not finish. Check the Omarchy terminal and try again."
-      }
+      if (code !== 0) return
+      root.installing = false
+      installPoll.stop()
+      installTimeout.stop()
+      root.loadedKey = ""
+      root.ensureRange()
     }
   }
 

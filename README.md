@@ -55,9 +55,19 @@ except your calendar data from Google.
 | `systemd` (`busctl`) | Talks to GNOME Online Accounts over D-Bus. |
 | `libnotify` (`notify-send`) | Event notifications. Already part of Omarchy. |
 
-The plugin writes only to its own state folder, `~/.local/state/omagoocal/`.
-It never edits your Hyprland, shell, or theme configuration; enabling it in
-the bar goes through `omarchy plugin enable`, which is your action.
+The plugin writes only to its own state folder, `~/.local/state/omagoocal/`,
+which it checks is a real directory it owns, mode `0700`, before every read
+or write; files are replaced atomically through random exclusive temp files
+and never through a symlink. It never edits your Hyprland, shell, or theme
+configuration; enabling it in the bar goes through `omarchy plugin enable`,
+which is your action.
+
+Because the backend holds a Google access token while it runs, nothing on
+that path is resolved through `PATH`: it runs under `/usr/bin/python3` and
+calls `/usr/bin/busctl`, `/usr/bin/notify-send`, `/usr/bin/xdg-open`,
+`/usr/bin/pacman` and Omarchy's own installer under `/usr/share/omarchy/bin`
+by absolute path. Every API response is capped at 8 MiB and every paginated
+listing at 20 pages / 5000 items.
 
 ## Remove
 

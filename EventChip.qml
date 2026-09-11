@@ -127,7 +127,7 @@ Rectangle {
     onClicked: function(mouse) {
       if (root.overflow) root.overflowClicked()
       else if (mouse.button === Qt.MiddleButton && root.event.link)
-        Quickshell.execDetached(["xdg-open", root.event.link])
+        Quickshell.execDetached(["/usr/bin/xdg-open", root.event.link])
       else
         root.panel.edit(root.event)
     }

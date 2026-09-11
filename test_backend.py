@@ -11,7 +11,8 @@ spec = importlib.util.spec_from_loader(
 gcal = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gcal)
 
-gcal.STATE = tempfile.mkdtemp()
+gcal.STATE = tempfile.mkdtemp()          # mkdtemp is 0700 and ours: valid
+gcal._state_cache = None
 gcal.CONFIG = os.path.join(gcal.STATE, "config.json")
 gcal.CACHE = os.path.join(gcal.STATE, "cache.json")
 gcal.LAST_SYNC = os.path.join(gcal.STATE, "last-sync.json")
@@ -21,6 +22,62 @@ gcal._write(gcal.CONFIG, {"notifyMinutes": 30})
 assert gcal.load_config()["notifyMinutes"] == 30
 assert gcal.load_config()["weekStart"] == gcal.DEFAULTS["weekStart"], "defaults fill in"
 assert oct(os.stat(gcal.CONFIG).st_mode)[-3:] == "600"
+
+# -- state I/O: random exclusive temp files, no stray .tmp, never through a symlink
+assert not [f for f in os.listdir(gcal.STATE) if f.endswith(".tmp")], "temp file left behind"
+link = os.path.join(gcal.STATE, "evil.json")
+os.symlink("/dev/null", link)
+try:
+    gcal._write(link, {"x": 1})
+    raise AssertionError("must refuse to write through a symlink")
+except RuntimeError as exc:
+    assert "symlink" in str(exc)
+assert os.path.islink(link) and gcal._read(link, "fallback") == "fallback", "read must not follow it either"
+os.unlink(link)
+
+# -- a state directory that is a symlink is refused outright
+real_state = gcal.STATE
+gcal.STATE = tempfile.mkdtemp() + "/link"
+os.symlink(real_state, gcal.STATE)
+gcal._state_cache = None
+try:
+    gcal._state_fd()
+    raise AssertionError("symlinked state dir must be refused")
+except OSError:
+    pass
+gcal.STATE = real_state
+gcal._state_cache = None
+
+# -- bounded responses: one oversized body is an error, not a memory spike
+class _Resp:
+    def __init__(self, body): self.body = body
+    def read(self, n=-1): return self.body if n < 0 else self.body[:n]
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+real_urlopen = gcal.urllib.request.urlopen
+gcal.urllib.request.urlopen = lambda req, timeout=None: _Resp(b"x" * (gcal.MAX_RESPONSE_BYTES + 1))
+try:
+    gcal.request("https://example.invalid/big")
+    raise AssertionError("oversized response must raise")
+except RuntimeError as exc:
+    assert "MiB" in str(exc)
+gcal.urllib.request.urlopen = lambda req, timeout=None: _Resp(b'{"ok": true}')
+assert gcal.request("https://example.invalid/small") == {"ok": True}
+gcal.urllib.request.urlopen = real_urlopen
+
+# -- bounded pagination: an endless nextPageToken stops at the page ceiling
+gcal.api = lambda account, path, params=None, payload=None, method=None: {"items": [1], "nextPageToken": "again"}
+try:
+    gcal.api_items("a@b.com", "/endless", {})
+    raise AssertionError("endless pagination must raise")
+except RuntimeError as exc:
+    assert "pages" in str(exc)
+gcal.api = lambda account, path, params=None, payload=None, method=None: {"items": [1] * 3000, "nextPageToken": "again"}
+try:
+    gcal.api_items("a@b.com", "/huge", {})
+    raise AssertionError("aggregate item ceiling must raise")
+except RuntimeError as exc:
+    assert "items" in str(exc)
 
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",
