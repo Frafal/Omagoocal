@@ -32,6 +32,10 @@ Panel {
   // must be decoded before it can be executed.
   readonly property string backend:
     decodeURIComponent(Qt.resolvedUrl("omagoocal").toString()).replace(/^file:\/\//, "")
+  // Run through the system interpreter by absolute path rather than executing
+  // the script: the same fixed interpreter the shebang names, but it no
+  // longer matters whether a clone preserved the executable bit.
+  readonly property var backendCmd: ["/usr/bin/python3", backend]
 
   // ---------------------------------------------------------------- state
   property string view: "week"                  // day | week | month | settings
@@ -187,7 +191,7 @@ Panel {
     // dropped one is always the one carrying the change the user just made.
     if (busy) { syncQueued = true; return }
     busy = true
-    var argv = [root.backend, "sync", Model.rfc3339(rangeStart()), Model.rfc3339(rangeEnd())]
+    var argv = root.backendCmd.concat(["sync", Model.rfc3339(rangeStart()), Model.rfc3339(rangeEnd())])
     if (forceFresh) argv.push("fresh")
     forceFresh = false
     syncProc.command = argv
@@ -252,7 +256,7 @@ Panel {
     mutateProc.pending = job.onDone
     mutateProc.failed = job.onFail
     mutateProc.payload = JSON.stringify(job.payload)
-    mutateProc.command = [root.backend, job.command]
+    mutateProc.command = root.backendCmd.concat([job.command])
     mutateProc.running = true
   }
 
@@ -283,7 +287,7 @@ Panel {
     if (configProc.running) { configDirty = true; return }
     configDirty = false
     configProc.payload = JSON.stringify(cfg)
-    configProc.command = [root.backend, "setall"]
+    configProc.command = root.backendCmd.concat(["setall"])
     configProc.running = true
   }
 
@@ -442,7 +446,7 @@ Panel {
   // with a size ceiling — the panel never opens a path itself.
   Process {
     id: snapshotProc
-    command: [root.backend, "snapshot"]
+    command: root.backendCmd.concat(["snapshot"])
     stdout: BackendOutput { id: snapshotOut; proc: snapshotProc }
     onStarted: snapshotOut.reset()
     onExited: function(code) {
@@ -553,7 +557,7 @@ Panel {
 
   Process {
     id: statusProc
-    command: [root.backend, "status"]
+    command: root.backendCmd.concat(["status"])
     stdout: BackendOutput { id: statusOut; proc: statusProc }
     onStarted: statusOut.reset()
     onExited: function(code) {
@@ -648,7 +652,10 @@ Panel {
   }
 
   // After the GOA window opens, the account shows up asynchronously. Poll
-  // briefly rather than making the user press refresh.
+  // briefly rather than making the user press refresh — with `status`, one
+  // D-Bus call and no network, so a three-minute wait is not sixty full
+  // syncs against Google. The first status that shows an account triggers
+  // the one sync that is needed.
   Timer {
     id: accountWatch
     interval: 3000
@@ -657,15 +664,14 @@ Panel {
     onRunningChanged: if (running) ticks = 0
     onTriggered: {
       ticks++
-      root.loadedKey = ""
-      root.ensureRange()
-      if (root.connected || ticks > 60) stop()
+      if (root.connected || ticks > 60) { stop(); return }
+      if (!statusProc.running) statusProc.running = true
     }
   }
 
   Process {
     id: loginProc
-    command: [root.backend, "login"]
+    command: root.backendCmd.concat(["login"])
     stdout: BackendOutput { id: loginOut; proc: loginProc }
     onStarted: loginOut.reset()
     onExited: function(code) {

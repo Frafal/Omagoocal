@@ -33,8 +33,12 @@ BarWidget {
   readonly property bool imminent: minutesAway <= imminentMinutes
   readonly property bool running: nextEvent && minutesAway <= 0
 
+  // With nothing upcoming the label is empty and the glyph alone stands in:
+  // the clock beside this widget already shows the date, and a second copy
+  // of it read as a gap in the bar.
+  readonly property bool iconOnly: vertical || !showNextEvent || !nextEvent
   readonly property string label: {
-    if (!nextEvent) return Qt.formatDate(now, "ddd d MMM")
+    if (!nextEvent) return ""
     var title = String(nextEvent.title)
     if (title.length > 22) title = title.substring(0, 21) + "…"
     return title + "  " + Model.relative(nextEvent.startAt, now)
@@ -107,8 +111,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.vertical || !root.showNextEvent ? "" : root.label
-    labelVisible: !root.vertical && root.showNextEvent
+    text: root.iconOnly ? "" : root.label
+    labelVisible: !root.iconOnly
     hasVisualContent: true
     horizontalMargin: 8.75
     verticalPadding: 8.75
@@ -139,9 +143,10 @@ BarWidget {
       NumberAnimation { to: 1.0; duration: 1100; easing.type: Easing.InOutSine }
     }
 
-    // Vertical bars have no room for a label; the glyph carries the colour.
+    // Vertical bars have no room for a label, and a bar with nothing to name
+    // shows only the glyph; either way the glyph carries the colour.
     Text {
-      visible: root.vertical || !root.showNextEvent
+      visible: root.iconOnly
       anchors.centerIn: parent
       text: "󰃭"
       color: button.foreground

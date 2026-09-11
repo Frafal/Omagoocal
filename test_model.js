@@ -2,7 +2,7 @@
 const fs = require('fs')
 const src = fs.readFileSync(__dirname + '/Model.js', 'utf8').replace('.pragma library', '')
 const M = {}
-new Function('exports', src + '\n;Object.assign(exports,{escapeMarkup,isWebLink,luma,isLightSurface,chipAlpha,dayKey,addDays,inclusiveEndDay,exclusiveEndDate,dueNotifications,weekdayLabel,startOfWeek,monthGrid,layout,decorateAll,onDay,splitAllDay,dayBounds,parseStamp,rfc3339,isoWeek,readableOn,relative,weekdayLabels,nextEvent,parseDayInput,parseTimeInput,combine,EVENT_COLORS})')(M)
+new Function('exports', src + '\n;Object.assign(exports,{weekDays,addMonths,escapeMarkup,isWebLink,luma,isLightSurface,chipAlpha,dayKey,addDays,inclusiveEndDay,exclusiveEndDate,dueNotifications,weekdayLabel,startOfWeek,monthGrid,layout,decorateAll,onDay,splitAllDay,dayBounds,parseStamp,rfc3339,isoWeek,readableOn,relative,weekdayLabels,nextEvent,parseDayInput,parseTimeInput,combine,EVENT_COLORS})')(M)
 
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ': ' + JSON.stringify(a) + ' != ' + JSON.stringify(b)) }
 const ok = (c, m) => { if (!c) throw new Error(m) }
@@ -230,5 +230,16 @@ const withBad = M.decorateAll([
   { id: 'bad2', start: '2026-01-05T09:00:00', end: '' },
 ])
 eq(withBad.map(e => e.id), ["ok"], "invalid timestamps are dropped")
+
+// calendar arithmetic at the year boundary and on leap days
+eq(M.isoWeek(new Date(2026, 11, 31)), 53, '31 Dec 2026 is ISO week 53')
+eq(M.isoWeek(new Date(2027, 0, 1)), 53, '1 Jan 2027 still belongs to week 53 of 2026')
+eq(M.isoWeek(new Date(2025, 11, 29)), 1, '29 Dec 2025 is week 1 of 2026')
+ok(M.parseDayInput('2028-02-29') !== null, '2028 is a leap year')
+eq(M.parseDayInput('2027-02-29'), null, '2027 is not')
+eq(M.addMonths(new Date(2026, 11, 15), 1).getFullYear(), 2027, 'month stepping crosses the year')
+eq(M.dayKey(M.addDays(new Date(2026, 11, 31), 1)), '2027-01-01', 'day stepping crosses the year')
+const wk = M.weekDays(new Date(2026, 0, 1), 1)
+eq([M.dayKey(wk[0]), M.dayKey(wk[6])], ['2025-12-29', '2026-01-04'], 'a week that straddles New Year')
 
 console.log('all checks passed')

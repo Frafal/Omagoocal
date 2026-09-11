@@ -407,6 +407,52 @@ except gcal.BudgetExceeded:
 assert drip.served <= gcal.READ_CHUNK * 3, "reading stopped at the budget, served %d" % drip.served
 gcal._opener.open = real_open
 
+# -- one retry on a transient status, none on a second failure, and never a
+#    retry of a write on a 5xx (the server may have acted on it)
+class _Fail:
+    def __init__(self, codes): self.codes = list(codes); self.calls = 0
+    def __call__(self, req, timeout=None):
+        self.calls += 1
+        code = self.codes.pop(0)
+        if code == 200: return _Resp(b'{"ok": true}')
+        raise gcal.urllib.error.HTTPError(req.full_url, code, "nope", {}, io.BytesIO(b""))
+real_open = gcal._opener.open; real_delay = gcal.RETRY_DELAY; gcal.RETRY_DELAY = 0
+f = _Fail([503, 200]); gcal._opener.open = f
+assert gcal.request(gcal.API + "/x") == {"ok": True} and f.calls == 2, "one retry then success"
+f = _Fail([429, 429]); gcal._opener.open = f
+try:
+    gcal.request(gcal.API + "/x"); raise AssertionError("second failure must stand")
+except RuntimeError as exc:
+    assert "429" in str(exc) and f.calls == 2, "exactly one retry"
+f = _Fail([503, 200]); gcal._opener.open = f
+try:
+    gcal.request(gcal.API + "/x", data={"a": 1}, method="POST"); raise AssertionError("a write is not retried on 503")
+except RuntimeError:
+    assert f.calls == 1
+f = _Fail([429, 200]); gcal._opener.open = f
+assert gcal.request(gcal.API + "/x", data={"a": 1}, method="POST") == {"ok": True}, "a write IS retried on 429 (not acted on)"
+gcal._opener.open = real_open; gcal.RETRY_DELAY = real_delay
+assert gcal._tls.minimum_version == gcal.ssl.TLSVersion.TLSv1_2 and gcal._tls.check_hostname
+
+# -- argv timestamps are validated before they reach a URL or the snapshot
+for bad in ("2026-01-01", "yesterday", "2026-01-01T00:00:00", ""):
+    try:
+        gcal._stamp(bad, "timeMin"); raise AssertionError("must reject: " + repr(bad))
+    except RuntimeError as exc:
+        assert "timeMin" in str(exc)
+assert gcal._stamp("2026-01-01T00:00:00-06:00", "t") and gcal._stamp("2026-01-01T00:00:00Z", "t")
+
+# -- a calendar id with a control character cannot poison the config key
+gcal._write(gcal.CACHE, {})
+gcal._accounts_cache = None
+gcal._tokens["a@b.com"] = "t"
+gcal.api = lambda account, path, params=None, payload=None, method=None, budget=None: (
+    {"items": [{"id": "good", "summary": "G", "accessRole": "owner"},
+               {"id": "bad\tid", "summary": "B", "accessRole": "owner"},
+               {"id": "", "summary": "E", "accessRole": "owner"}]} if path.endswith("calendarList") else {"items": []})
+assert [c["id"] for c in gcal.calendar_list(fresh=True)] == ["good"]
+gcal._tokens.clear()
+
 # -- request bodies: all-day uses date, timed uses dateTime, blanks are dropped
 timed = gcal._body({"title": "T", "start": "2026-01-01T09:00:00-06:00",
                     "end": "2026-01-01T10:00:00-06:00"})

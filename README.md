@@ -107,7 +107,7 @@ packages only for this plugin, uninstall `gnome-online-accounts-gtk` and
 
 | Where | Action |
 |---|---|
-| Bar label | Next event and how long you have. It takes that event's colour in the last 15 minutes before it starts. |
+| Bar label | Next event and how long you have. It takes that event's colour in the last 15 minutes before it starts; with nothing upcoming, just the glyph. |
 | Bar left click | Open the calendar |
 | Bar right click | Refresh, bypassing every cache |
 | Bar middle click | New event |

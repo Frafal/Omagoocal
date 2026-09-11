@@ -24,7 +24,9 @@ network response and page walk has a ceiling.
 import base64
 import json
 import os
+import re
 import signal
+import ssl
 import subprocess
 import stat
 import sys
@@ -60,6 +62,8 @@ MAX_TITLE = 1024
 MAX_LOCATION = 1024
 MAX_DESCRIPTION = 8192
 MAX_SHORT = 512                         # ids, names, colours, links, emails
+RETRY_STATUSES = (429, 500, 502, 503)   # one bounded retry, then the error stands
+RETRY_DELAY = 1.5
 MAX_TOTAL_EVENTS = 10000                # across every calendar in one sync
 MAX_TOTAL_CALENDARS = 500               # across every account
 MAX_SYNC_BYTES = 16 * 1024 * 1024       # raw response bytes across one whole sync
@@ -360,17 +364,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
                                      headers, fp)
 
 
-_opener = urllib.request.build_opener(_NoRedirect())
+_tls = ssl.create_default_context()          # system CA store, hostname checked
+_tls.minimum_version = ssl.TLSVersion.TLSv1_2
+_opener = urllib.request.build_opener(_NoRedirect(),
+                                      urllib.request.HTTPSHandler(context=_tls))
+USER_AGENT = "omagoocal/1.0 (Omarchy; +https://github.com/huligabuliga/Omagoocal)"
 
 
-def request(url, data=None, headers=None, method=None, budget=None):
+def request(url, data=None, headers=None, method=None, budget=None, _retried=False):
     if not url.startswith(API + "/"):
         raise RuntimeError("Refusing request outside the Calendar API: " + url.split("?")[0])
     if budget:
         budget.check()
     body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, method=method,
-                                 headers=headers or {})
+    hdrs = dict(headers or {})
+    hdrs["User-Agent"] = USER_AGENT
+    req = urllib.request.Request(url, data=body, method=method, headers=hdrs)
     raw = bytearray()
     try:
         with _opener.open(req, timeout=30) as resp:
@@ -389,6 +398,13 @@ def request(url, data=None, headers=None, method=None, budget=None):
                     budget.charge(nbytes=len(chunk))
     except urllib.error.HTTPError as exc:
         detail = exc.read(4096).decode(errors="replace")[:400]
+        # A single retry for the statuses Google uses for "not right now".
+        # Reads are idempotent; a write is retried only on 429, where the
+        # server has not acted on it.
+        if (not _retried and exc.code in RETRY_STATUSES
+                and (method in (None, "GET") or exc.code == 429)):
+            time.sleep(RETRY_DELAY)
+            return request(url, data, headers, method, budget, _retried=True)
         raise RuntimeError("%s %s: %s" % (exc.code, url.split("?")[0], detail))
     return json.loads(bytes(raw)) if raw else {}
 
@@ -426,6 +442,17 @@ def api_items(account, path, params, budget=None):
         params["pageToken"] = token
     raise RuntimeError("More than %d pages from %s; refusing to keep going"
                        % (MAX_PAGES, path))
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$")
+
+
+def _stamp(value, what):
+    """An RFC 3339 timestamp from argv, or an error naming which one."""
+    if not isinstance(value, str) or not _STAMP.match(value):
+        raise RuntimeError("%s must be an RFC 3339 timestamp" % what)
+    return value
 
 
 def _text(value, limit):
@@ -493,6 +520,8 @@ def calendar_list(fresh=False):
         for cal in items:
             if not isinstance(cal, dict) or not isinstance(cal.get("id"), str):
                 continue
+            if not cal["id"] or _CONTROL.search(cal["id"]):
+                continue                     # would break the tab-joined config key
             key = email + "\t" + cal["id"]
             out.append({
                 "account": _text(email, MAX_SHORT),
@@ -714,6 +743,9 @@ def main(argv):
     if cmd == "sync":                      # sync <timeMin> <timeMax> [fresh]
         # One call per refresh. The panel needs all three together and every
         # one of them already walks the calendar list.
+        if len(argv) < 3:
+            raise RuntimeError("sync needs <timeMin> <timeMax>")
+        time_min, time_max = _stamp(argv[1], "timeMin"), _stamp(argv[2], "timeMax")
         fresh = len(argv) > 3 and argv[3] == "fresh"
         status = main(["status"])
         payload = {"status": status, "calendars": [], "events": []}
@@ -721,12 +753,12 @@ def main(argv):
             # Fetched once and handed on: events() would otherwise pull the
             # whole calendar list a second time.
             payload["calendars"] = calendar_list(fresh)
-            payload["events"] = events(argv[1], argv[2], payload["calendars"], fresh)
+            payload["events"] = events(time_min, time_max, payload["calendars"], fresh)
             # Kept so the panel can paint the last known week the instant the
             # shell starts. Event text on disk is a trade some people will not
             # want, so it is a preference; off means nothing is kept.
             if cfg.get("snapshot", True):
-                _write(LAST_SYNC, {"timeMin": argv[1], "timeMax": argv[2],
+                _write(LAST_SYNC, {"timeMin": time_min, "timeMax": time_max,
                                    "payload": payload})
             else:
                 _remove(LAST_SYNC)
@@ -809,7 +841,12 @@ if __name__ == "__main__":
         text = emit(main(sys.argv[1:]))
         signal.alarm(0)                            # the work is done; do not cut the output
         print(text)
+    except BrokenPipeError:
+        os._exit(1)                                # the reader is gone; nothing to say
     except Exception as exc:                       # one error shape for the UI
         signal.alarm(0)
-        print(json.dumps({"error": str(exc)[:2000]}))
+        try:
+            print(json.dumps({"error": str(exc)[:2000]}))
+        except BrokenPipeError:
+            pass
         sys.exit(1)
