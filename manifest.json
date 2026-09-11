@@ -18,6 +18,7 @@
     "displayName": "Omagoocal",
     "description": "Next event in the bar, full calendar in the popup. Left = calendar, right = refresh, middle = new event.",
     "category": "Time",
+    "defaultSection": "center",
     "aliases": [
       "gcal",
       "omagoocal"
