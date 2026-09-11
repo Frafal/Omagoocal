@@ -13,9 +13,8 @@ import "Model.js" as Model
 // colour anywhere except the colours Google already assigned to the events
 // themselves. That way the chroma on screen is information, not decoration.
 //
-// All Google traffic goes through `omagoocal`; this file never speaks
-// HTTP. One `sync` subprocess per refresh returns accounts, calendars and
-// events together.
+// Data and every subprocess live in Store.qml; this file only draws and
+// forwards. It never speaks HTTP and never opens a path.
 Panel {
   id: root
   moduleName: "io.github.huligabuliga.omagoocal"
@@ -26,85 +25,63 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  // The backend ships inside the plugin, so a clone of the repo is the whole
-  // thing — nothing to put on PATH before it works.
-  // resolvedUrl percent-encodes, so a home directory with a space in it
-  // must be decoded before it can be executed.
-  readonly property string backend:
-    decodeURIComponent(Qt.resolvedUrl("omagoocal").toString()).replace(/^file:\/\//, "")
-  // Run through the system interpreter by absolute path rather than executing
-  // the script: the same fixed interpreter the shebang names, but it no
-  // longer matters whether a clone preserved the executable bit.
-  // -I: isolated mode — PYTHON* environment variables and the user site are
-  // ignored, and the script's own directory is not put on sys.path.
-  // -X utf8: stdin/stdout are UTF-8 regardless of locale.
-  readonly property var backendCmd: ["/usr/bin/python3", "-I", "-X", "utf8", backend]
+  // The data lives in Store.qml, one instance per shell, so a second
+  // monitor's panel shows the same events without a second backend and
+  // without a second copy of every notification. The host hands it over
+  // through the bar facade; a replacement bar that offers no service lookup
+  // gets a private copy instead.
+  readonly property var hostStore: bar && bar.shell && typeof bar.shell.serviceFor === "function"
+    ? bar.shell.serviceFor(moduleName) : null
+  readonly property var store: hostStore || privateStore.item
 
-  // Every process that will hold a Google access token runs with an explicit
-  // minimal environment: only what the interpreter needs to find our state
-  // directory and the session bus. Under clearEnvironment, null means "pass
-  // the system's value", so nothing else from the shell — PYTHONPATH,
-  // LD_PRELOAD, a proxy — can reach it. The login process is the exception:
-  // it launches a GTK window and needs the display.
-  component BackendProcess: Process {
-    clearEnvironment: true
-    environment: ({
-      HOME: null,
-      XDG_RUNTIME_DIR: null,
-      DBUS_SESSION_BUS_ADDRESS: null
-    })
+  Loader {
+    id: privateStore
+    active: !!root.bar && !root.hostStore
+    source: Qt.resolvedUrl("Store.qml")
+  }
+
+  readonly property var events: store ? store.events : []
+  readonly property var calendars: store ? store.calendars : []
+  readonly property var accounts: store ? store.accounts : []
+  readonly property var cfg: store ? store.cfg : ({})
+  readonly property bool busy: store ? store.busy : false
+  readonly property string error: store ? store.error : ""
+  readonly property bool everSynced: store ? store.everSynced : false
+  readonly property bool depsInstalled: store ? store.depsInstalled : false
+  readonly property bool depsChecking: store ? store.depsChecking : true
+  readonly property bool installing: store ? store.installing : false
+  readonly property string installError: store ? store.installError : ""
+  readonly property var requiredPackages: store ? store.requiredPackages : []
+
+  function fail(message) { if (store) store.error = message }
+  function ensureRange() { if (store) store.ensureRange(anchor) }
+  function invalidate() { if (store) store.invalidate() }
+  function refreshNow() { if (store) store.refreshNow(anchor) }
+  function setConfig(key, value) { if (store) store.setConfig(key, value) }
+  function calendarEnabled(cal) { return store ? store.calendarEnabled(cal) : true }
+  function toggleCalendar(cal) { if (store) store.toggleCalendar(cal) }
+  function login() { if (store) store.login() }
+  function installDeps() { if (store) store.installDeps() }
+
+  // Routing: no account means there is nothing else to show. Once one
+  // exists, hand back to the calendar unless settings were asked for.
+  function route(initial) {
+    if (!connected) view = "settings"
+    else if (initial || (view === "settings" && !settingsPinned)) view = cfg.defaultView || "week"
+  }
+  onStoreChanged: if (store) route(true)
+
+  Connections {
+    target: root.store
+    function onSynced() { root.route(false) }
+    function onStatusRead() { root.route(true) }
   }
 
   // ---------------------------------------------------------------- state
   property string view: "week"                  // day | week | month | settings
   property date anchor: new Date()              // the date the view is built around
   property date now: new Date()
-  property var events: []
-  property var calendars: []
-  property var accounts: []
-  property var cfg: ({})
 
-  // ---- Dependencies. GNOME Online Accounts is what makes this plugin
-  //      installable by anyone: it carries the distro's own Google OAuth
-  //      client, so no user ever creates a Google Cloud project and the
-  //      plugin never needs Google's verification review.
-  //
-  //      The install follows the Omarchy convention: Omarchy's own installer
-  //      in a visible floating terminal (which is also where its password
-  //      prompt is answered), then a poll of pacman until the packages land.
-  //
-  //      Every executable here is an absolute path and no shell of ours is
-  //      involved: the probe is pacman itself, and the install hands the
-  //      terminal wrapper one fixed command.
-  property bool depsInstalled: false
-  property bool depsChecking: true
-  property bool installing: false
-  property string installError: ""
-
-  readonly property var requiredPackages: ["gnome-online-accounts", "gnome-online-accounts-gtk", "python"]
-  readonly property string pacman: "/usr/bin/pacman"
-  readonly property string omarchyBin: "/usr/share/omarchy/bin"
-
-  function checkDeps() {
-    if (depsProc.running) return
-    depsChecking = true
-    depsProc.command = [pacman, "-Q"].concat(requiredPackages)
-    depsProc.running = true
-  }
-
-  function installDeps() {
-    installing = true
-    installError = ""
-    installProc.command = [
-      omarchyBin + "/omarchy-launch-floating-terminal-with-presentation",
-      omarchyBin + "/omarchy-pkg-add " + requiredPackages.join(" ")]
-    installProc.startDetached()
-    installPoll.restart()
-    installTimeout.restart()
-  }
-  property bool busy: false
-  property string error: ""
-  property bool everSynced: false
   // Set when the user asks for settings, so a background refresh never yanks
   // them out of it — and cleared when they pick a calendar view, so the
   // not-connected screen can hand back over once an account appears.
@@ -183,162 +160,10 @@ Panel {
     ensureRange()
   }
 
-  // ---------------------------------------------------------------- data
-  //
-  // A month either side of the anchor, so paging a week at a time almost
-  // never costs a round trip and month view is always fully populated.
-  property string loadedKey: ""
-  property string pendingKey: ""   // promoted to loadedKey only once it lands
-
-  function rangeStart() { return Model.addDays(new Date(anchor.getFullYear(), anchor.getMonth(), 1), -14) }
-  function rangeEnd() { return Model.addDays(new Date(anchor.getFullYear(), anchor.getMonth() + 1, 1), 14) }
-
-  function ensureRange() {
-    var key = anchor.getFullYear() + "-" + anchor.getMonth()
-    if (key === loadedKey && everSynced) return
-    pendingKey = key
-    sync()
-  }
-
-  property bool syncQueued: false
-
-  property bool forceFresh: false
-
-  function sync() {
-    // A refresh asked for while one is in flight is queued, not dropped: the
-    // dropped one is always the one carrying the change the user just made.
-    if (busy) { syncQueued = true; return }
-    busy = true
-    var argv = root.backendCmd.concat(["sync", Model.rfc3339(rangeStart()), Model.rfc3339(rangeEnd())])
-    if (forceFresh) argv.push("fresh")
-    forceFresh = false
-    syncProc.command = argv
-    syncProc.running = true
-  }
-
-  // The refresh button means "I don't trust what I see": skip every cache.
-  function refreshNow() {
-    forceFresh = true
-    loadedKey = ""
-    ensureRange()
-  }
-
-  // `fromCache` paints the last known result without claiming the range is
-  // loaded, so the real sync that follows still runs.
-  function applySync(payload, fromCache) {
-    if (payload.error) { error = payload.error; return }
-    var status = payload.status || {}
-    // Never let a sync that started before an unsaved edit overwrite it, and
-    // never let the startup snapshot — possibly older than config.json —
-    // overwrite what status just read.
-    if (!fromCache && !configProc.running && !configDirty) {
-      var incoming = status.config || {}
-      if (calendarsLocal) incoming.calendars = cfg.calendars
-      cfg = incoming
-    }
-    accounts = status.accounts || []
-    calendars = payload.calendars || []
-    events = Model.decorateAll(payload.events)
-
-    // Per-calendar failures ride along inside the event list rather than
-    // failing the whole refresh; one revoked account should not blank the
-    // other three.
-    var trouble = (payload.events || []).filter(function(e) { return e && e.error })
-    error = trouble.length ? trouble[0].calendar + ": " + trouble[0].error : ""
-    if (fromCache) return
-    everSynced = true
-    loadedKey = pendingKey         // a failed fetch leaves the month retryable
-
-    // Routing: no account means there is nothing else to show. Once one
-    // exists, hand back to the calendar unless settings were asked for.
-    if (!connected) view = "settings"
-    else if (view === "settings" && !settingsPinned) view = cfg.defaultView || "week"
-  }
-
-  // Payloads travel on stdin, not argv: argv is readable by every local
-  // process, and these carry event text and settings. Same pattern Omarchy's
-  // network panel uses for Wi-Fi secrets.
-  property var mutationQueue: []
-
-  function mutate(command, payload, onDone, onFail) {
-    mutationQueue.push({ command: command, payload: payload, onDone: onDone || null, onFail: onFail || null })
-    pumpMutations()
-  }
-
-  // One process, one mutation at a time: a delete followed at once by a
-  // create must not overwrite each other's command or callback.
-  function pumpMutations() {
-    if (mutateProc.running || mutationQueue.length === 0) return
-    var job = mutationQueue.shift()
-    busy = true
-    mutateProc.pending = job.onDone
-    mutateProc.failed = job.onFail
-    mutateProc.payload = JSON.stringify(job.payload)
-    mutateProc.command = root.backendCmd.concat([job.command])
-    mutateProc.running = true
-  }
-
-  // ---- Config writes.
-  //
-  // The panel is the owner of this config while it is open, so every write
-  // sends the whole document and the last one wins. A control must never wait
-  // on a subprocess to show the state the user just chose, so `cfg` moves
-  // first and the disk catches up.
-  property bool configDirty: false
-  property bool refreshAfterConfig: false
-  // Once the user has touched a toggle, the panel is the authority on the
-  // calendar map for the rest of the session. A sync that was already in
-  // flight when they clicked would otherwise hand back the old value and
-  // bounce the switch — which is exactly what "I have to click it twice"
-  // looks like.
-  property bool calendarsLocal: false
-
-  function setConfig(key, value) {
-    var next = {}
-    for (var k in cfg) next[k] = cfg[k]
-    next[key] = value
-    cfg = next
-    persistConfig()
-  }
-
-  function persistConfig() {
-    if (configProc.running) { configDirty = true; return }
-    configDirty = false
-    configProc.payload = JSON.stringify(cfg)
-    configProc.command = root.backendCmd.concat(["setall"])
-    configProc.running = true
-  }
-
-  function calendarKey(cal) { return cal.account + "\t" + cal.id }
-
-  // Read from the local config, not from the last sync: this is what makes a
-  // toggle land on the first click instead of the third.
-  function calendarEnabled(cal) {
-    var value = (cfg.calendars || {})[calendarKey(cal)]
-    return value !== false
-  }
-
-  function toggleCalendar(cal) {
-    var map = {}
-    for (var k in (cfg.calendars || {})) map[k] = cfg.calendars[k]
-    map[calendarKey(cal)] = !calendarEnabled(cal)
-    calendarsLocal = true
-    refreshAfterConfig = true
-    setConfig("calendars", map)
-  }
-
-  // Sign-in is GOA's window, showing Google's own consent screen. We only
-  // open it, then watch for the account to appear.
-  function login() {
-    error = ""
-    loginProc.running = true
-    accountWatch.restart()
-  }
-
   // ------------------------------------------------------------- editing
   function compose(start, allDay) {
     var writable = calendars.filter(function(c) { return c.writable && c.enabled })
-    if (!writable.length) { error = "No writable calendar is enabled."; return }
+    if (!writable.length) { fail("No writable calendar is enabled."); return }
 
     // Default to the account's own calendar. Alphabetical order lands on
     // whatever shared calendar sorts first, which is never where someone
@@ -370,13 +195,14 @@ Panel {
   }
 
   function edit(ev) {
-    if (!ev.writable) { error = "That calendar is read-only."; return }
+    if (!ev.writable) { fail("That calendar is read-only."); return }
     var copy = {}
     for (var k in ev) copy[k] = ev[k]
     editing = copy
   }
 
   function saveEvent(ev) {
+    if (!store) return
     var payload = {
       id: ev.id,
       account: ev.account,
@@ -396,38 +222,18 @@ Panel {
 
     var draft = editing
     editing = null
-    mutate("save", payload,
-           function() { loadedKey = ""; ensureRange() },
+    store.mutate("save", payload,
+           function() { root.invalidate() },
            function() { editing = draft })       // failed: hand the text back
   }
 
   function deleteEvent(ev) {
+    if (!store) return
     var draft = editing
     editing = null
-    mutate("delete", { account: ev.account, calendarId: ev.calendarId, id: ev.id },
-           function() { loadedKey = ""; ensureRange() },
+    store.mutate("delete", { account: ev.account, calendarId: ev.calendarId, id: ev.id },
+           function() { root.invalidate() },
            function() { editing = draft })
-  }
-
-  // ------------------------------------------------------- notifications
-  //
-  // ponytail: fired ids live in memory, so restarting the shell inside an
-  // event's lead window can repeat one notification. Persist the set if that
-  // ever becomes more than a curiosity.
-  property var fired: ({})
-
-  function checkNotifications() {
-    var due = Model.dueNotifications(events, now, notifyMinutes, fired)
-    for (var i = 0; i < due.length; i++) {
-      var ev = due[i]
-      fired[ev.id] = true
-      // "--" so a title beginning with "-" is text, not an option.
-      Quickshell.execDetached(["/usr/bin/notify-send", "-a", "Calendar", "-u", "normal",
-        "-t", "12000", "-i", "office-calendar", "--",
-        Model.escapeMarkup(ev.title),
-        Model.escapeMarkup(Model.relative(ev.startAt, now) + " · " + Model.rangeLabel(ev, hours12)
-          + (ev.location ? "\n" + ev.location : ""))])
-    }
   }
 
   // ---------------------------------------------------------- lifecycle
@@ -451,252 +257,10 @@ Panel {
     return false
   }
 
-  Component.onCompleted: {
-    statusProc.running = true        // config before first paint, so the
-    snapshotProc.running = true      // panel opens on the user's default view
-    checkDeps()
-  }
-
-  // Last sync, on disk. Painted at startup so a shell restart shows last
-  // week's state at once rather than an empty grid, and the bar has a next
-  // event to name from the first frame. Read by the backend, not by QML: the
-  // backend opens state files no-follow, relative to a validated directory,
-  // with a size ceiling — the panel never opens a path itself.
-  BackendProcess {
-    id: snapshotProc
-    command: root.backendCmd.concat(["snapshot"])
-    stdout: BackendOutput { id: snapshotOut; proc: snapshotProc }
-    onStarted: snapshotOut.reset()
-    onExited: function(code) {
-      var text = snapshotOut.take()
-      if (root.everSynced || text === "") return
-      {
-        try {
-          var snap = JSON.parse(text)
-          // Only if the saved window still covers the one we are about to
-          // ask for; otherwise the fetch alone is the honest picture.
-          if (snap.payload && Model.parseStamp(snap.timeMin) <= root.rangeStart()
-              && Model.parseStamp(snap.timeMax) >= root.rangeEnd())
-            root.applySync(snap.payload, true)
-        } catch (e) { /* no snapshot yet, or a stale shape: the sync covers it */ }
-      }
-    }
-  }
-
   SystemClock {
     id: clock
     precision: SystemClock.Minutes
-    onDateChanged: {
-      root.now = date
-      root.checkNotifications()
-    }
-  }
-
-  Timer {
-    // Polling, not push: Google's watch channels need a public callback URL,
-    // which a laptop on someone's desk does not have.
-    interval: root.refreshMinutes * 60000
-    running: root.connected
-    repeat: true
-    onTriggered: { root.loadedKey = ""; root.ensureRange() }
-  }
-
-  // Every backend process gets a hard deadline. The backend alarms itself
-  // at 120s; this is the outer wall for the case where it cannot, so a hung
-  // helper is killed, never waited on.
-  component Deadline: Timer {
-    property var target
-    property int seconds
-    interval: seconds * 1000
-    running: target ? target.running === true : false
-    onTriggered: {
-      if (!target || !target.running) return
-      target.signal(9)
-      root.error = "The backend stopped answering and was terminated."
-    }
-  }
-
-  Deadline { target: syncProc; seconds: 150 }
-  Deadline { target: statusProc; seconds: 30 }
-  Deadline { target: snapshotProc; seconds: 30 }
-  Deadline { target: mutateProc; seconds: 90 }
-  Deadline { target: configProc; seconds: 30 }
-  Deadline { target: loginProc; seconds: 30 }
-  Deadline { target: depsProc; seconds: 30 }
-
-  // The producer caps its own output at 16 MiB; this is the consumer-side
-  // ceiling so a misbehaving helper can never fill the shell's memory.
-  readonly property int maxBackendOutput: 20 * 1024 * 1024
-
-  // Backend output arrives line by line (the backend frames its JSON at
-  // token boundaries), and is counted as it arrives: past the ceiling the
-  // process is killed and what was buffered is dropped — never collected
-  // in full first, which is what StdioCollector would do.
-  component BackendOutput: SplitParser {
-    splitMarker: "\n"
-    property var proc
-    property var lines: []
-    property int bytes: 0
-    property bool overflowed: false
-    onRead: function(data) {
-      if (overflowed) return
-      bytes += data.length
-      if (bytes > root.maxBackendOutput) {
-        overflowed = true
-        lines = []
-        if (proc && proc.running) proc.signal(9)
-        return
-      }
-      lines.push(data)
-    }
-    function take() {
-      var text = overflowed ? "" : lines.join("")
-      lines = []; bytes = 0; overflowed = false
-      return text
-    }
-    function reset() { lines = []; bytes = 0; overflowed = false }
-  }
-
-  BackendProcess {
-    id: syncProc
-    stdout: BackendOutput { id: syncOut; proc: syncProc }
-    onStarted: syncOut.reset()
-    onExited: function(code) {
-      root.busy = false
-      if (syncOut.overflowed) { syncOut.take(); root.error = "Backend output exceeded the size limit."; return }
-      var text = syncOut.take()
-      if (code !== 0 && text === "") { root.error = "Backend exited with status " + code; return }
-      try { root.applySync(JSON.parse(text || "{}")) }
-      catch (e) { root.error = "Backend returned junk: " + text.substring(0, 120) }
-      root.checkNotifications()
-      if (root.syncQueued) { root.syncQueued = false; Qt.callLater(root.sync) }
-    }
-  }
-
-  BackendProcess {
-    id: statusProc
-    command: root.backendCmd.concat(["status"])
-    stdout: BackendOutput { id: statusOut; proc: statusProc }
-    onStarted: statusOut.reset()
-    onExited: function(code) {
-      var text = statusOut.take()
-      if (text === "") return
-      {
-        try {
-          var status = JSON.parse(text)
-          root.cfg = status.config || {}
-          root.accounts = status.accounts || []
-          root.view = root.connected ? (root.cfg.defaultView || "week") : "settings"
-          // Until now the first fetch waited for a click or the 5-minute
-          // timer, so the bar named no event for minutes after a restart.
-          if (root.connected) root.ensureRange()
-        } catch (e) { /* first run, nothing stored yet */ }
-      }
-    }
-  }
-
-  BackendProcess {
-    id: mutateProc
-    property var pending: null
-    property var failed: null
-    property string payload: ""
-    stdinEnabled: true
-    stdout: BackendOutput { id: mutateOut; proc: mutateProc }
-    onStarted: { mutateOut.reset(); write(payload + "\n"); payload = "" }
-    onExited: function(code) {
-      root.busy = false
-      var result = {}
-      if (mutateOut.overflowed) { mutateOut.take(); result = { error: "Backend output exceeded the size limit." } }
-      else try { result = JSON.parse(mutateOut.take() || "{}") } catch (e) { result = { error: "Backend returned junk." } }
-      if (result.error) { root.error = result.error; if (mutateProc.failed) mutateProc.failed() }
-      else if (mutateProc.pending) mutateProc.pending()
-      mutateProc.pending = null
-      mutateProc.failed = null
-      Qt.callLater(root.pumpMutations)
-    }
-  }
-
-  BackendProcess {
-    id: configProc
-    property string payload: ""
-    stdinEnabled: true
-    stdout: BackendOutput { id: configOut; proc: configProc }
-    onStarted: { configOut.reset(); write(payload + "\n"); payload = "" }
-    onExited: {
-      var result = {}
-      try { result = JSON.parse(configOut.take() || "{}") } catch (e) {}
-      if (result.error) root.error = "Settings were not saved: " + result.error
-      if (root.configDirty) { root.persistConfig(); return }
-      if (!root.refreshAfterConfig) return
-      root.refreshAfterConfig = false
-      root.loadedKey = ""
-      root.ensureRange()
-    }
-  }
-
-  Process {
-    id: depsProc
-    onExited: function(code) {
-      root.depsChecking = false
-      root.depsInstalled = code === 0
-      if (code !== 0) return
-      root.installing = false
-      installPoll.stop()
-      installTimeout.stop()
-      root.loadedKey = ""
-      root.ensureRange()
-    }
-  }
-
-  Process { id: installProc }
-
-  Timer {
-    id: installPoll
-    interval: 2000
-    repeat: true
-    running: root.installing && !root.depsInstalled
-    onTriggered: root.checkDeps()
-  }
-
-  Timer {
-    id: installTimeout
-    interval: 300000
-    onTriggered: {
-      if (!root.installing) return
-      root.installing = false
-      installPoll.stop()
-      root.installError = "Still waiting on the installer. Check the Omarchy terminal."
-    }
-  }
-
-  // After the GOA window opens, the account shows up asynchronously. Poll
-  // briefly rather than making the user press refresh — with `status`, one
-  // D-Bus call and no network, so a three-minute wait is not sixty full
-  // syncs against Google. The first status that shows an account triggers
-  // the one sync that is needed.
-  Timer {
-    id: accountWatch
-    interval: 3000
-    repeat: true
-    property int ticks: 0
-    onRunningChanged: if (running) ticks = 0
-    onTriggered: {
-      ticks++
-      if (root.connected || ticks > 60) { stop(); return }
-      if (!statusProc.running) statusProc.running = true
-    }
-  }
-
-  Process {
-    id: loginProc
-    command: root.backendCmd.concat(["login"])
-    stdout: BackendOutput { id: loginOut; proc: loginProc }
-    onStarted: loginOut.reset()
-    onExited: function(code) {
-      var result = {}
-      try { result = JSON.parse(loginOut.take() || "{}") } catch (e) {}
-      if (result.error) root.error = result.error
-    }
+    onDateChanged: root.now = date
   }
 
 

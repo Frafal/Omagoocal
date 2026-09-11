@@ -177,6 +177,10 @@ from the surface luminance. Verified on `futurenergy`, `catppuccin-latte`,
 - **Nothing is truncated.** Every paginated API response is followed to its
   last page, so a shared calendar with hundreds of jobs a month shows all of
   them.
+- **One backend per shell.** The data and every subprocess live in a plugin
+  service (`Store.qml`) that the shell loads once; each monitor's bar widget
+  and panel read from it. Two monitors mean one fetch and one notification,
+  not two of each.
 
 ## Development
 
@@ -187,6 +191,10 @@ python3 test_backend.py # GOA account discovery and API request shaping
 
 `omagoocal` is stdlib-only Python and talks to GOA over `busctl`, so there
 is no `pip` dependency and no `python-gobject`.
+
+Layout: `Store.qml` (service: data, processes, notifications), `Panel.qml`
+(the popup), `BarWidget.qml` (the bar label), the view files, `Model.js`
+(pure date and layout helpers), `omagoocal` (the backend).
 
 ## License
 
