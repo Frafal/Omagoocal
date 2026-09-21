@@ -131,15 +131,23 @@ In the editor, `Ctrl+Enter` saves and `Esc` cancels.
 
 An event booked through anything that integrates with Google Calendar —
 Meet, Zoom, Teams, Webex — carries the call with it, and so does one where
-somebody pasted the link into the description by hand. Both end up in a
-**CALL** box in the event card: **JOIN** opens a video link in your browser,
-and a dial-in offers **COPY** instead, with the PIN it is useless without
-already beside the number. A chip on the grid takes a 󰕧 when there is one,
-so you can see which of the morning's meetings you have to be somewhere for.
+somebody pasted the link into the description by hand. Either way the event
+card grows a **CALL** box with **JOIN** in it. A chip on the grid takes a
+󰕧 when there is one, so you can see which of the morning's meetings you
+have to be somewhere for.
+
+One row, not six. An invitation's boilerplate is full of links — a Teams
+block alone carries the join link, a dial-in lookup, a help page and the
+organiser's meeting options — so the box shows the join link and nothing
+else: the first video entry point the provider declared, which is the one
+thing every provider fills in the same way. What Google sent beats anything
+found in the prose. An event with only a dial-in number shows that instead,
+with **COPY** in place of JOIN and the PIN it is useless without already
+beside the number.
 
 Only `https://` is ever handed to `xdg-open`, and only a link on a known
-meeting host is pulled out of the notes — an unrecognised link stays in the
-notes where it was written, because a box labelled CALL that offers you a
+meeting host is ever considered — an unrecognised link stays in the notes
+where it was written, because a box labelled CALL that offers you a
 spreadsheet is worse than no box. The link is read, never rewritten: the
 box is not editable, and saving an event never sends a description you did
 not change.

@@ -2,7 +2,7 @@
 const fs = require('fs')
 const src = fs.readFileSync(__dirname + '/Model.js', 'utf8').replace('.pragma library', '')
 const M = {}
-new Function('exports', src + '\n;Object.assign(exports,{weekDays,addMonths,escapeMarkup,isWebLink,luma,isLightSurface,chipAlpha,dayKey,addDays,inclusiveEndDay,exclusiveEndDate,dueNotifications,weekdayLabel,startOfWeek,monthGrid,layout,decorateAll,onDay,splitAllDay,dayBounds,parseStamp,rfc3339,isoWeek,readableOn,relative,weekdayLabels,nextEvent,shownInBar,calendarKey,parseDayInput,parseTimeInput,combine,EVENT_COLORS,linkParts,meetingProvider,scrapeLinks,meetingLinks,notesPreview,notesLineCount,meetingName,meetingDetail,meetingCopyText})')(M)
+new Function('exports', src + '\n;Object.assign(exports,{weekDays,addMonths,escapeMarkup,isWebLink,luma,isLightSurface,chipAlpha,dayKey,addDays,inclusiveEndDay,exclusiveEndDate,dueNotifications,weekdayLabel,startOfWeek,monthGrid,layout,decorateAll,onDay,splitAllDay,dayBounds,parseStamp,rfc3339,isoWeek,readableOn,relative,weekdayLabels,nextEvent,shownInBar,calendarKey,parseDayInput,parseTimeInput,combine,EVENT_COLORS,linkParts,meetingProvider,scrapeLinks,meetingLinks,notesPreview,notesLineCount,meetingName,meetingDetail,meetingCopyText,primaryMeeting})')(M)
 
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ': ' + JSON.stringify(a) + ' != ' + JSON.stringify(b)) }
 const ok = (c, m) => { if (!c) throw new Error(m) }
@@ -323,6 +323,56 @@ const ordered = M.meetingLinks({ conference: { entries: [
   { kind: 'video', uri: 'https://acme.zoom.us/j/1' },
 ]}})
 eq(ordered.map(m => m.kind), ['video', 'phone'], 'what you can click comes first')
+
+// ---- one row, not six. A real Teams invitation body: the join link, then
+// four more links on hosts this file recognises, then the dial-in.
+const teamsBody = [
+  '________________________________________________________________',
+  'Microsoft Teams Need help?<https://aka.ms/JoinTeamsMeeting>',
+  'Join the meeting now<https://teams.microsoft.com/l/meetup-join/19%3ameeting_ZjQ>',
+  'Meeting ID: 123 456 789',
+  'Or dial in: +1 555-0100,,123456789# <tel:+15550100,,123456789#>',
+  'Find a local number<https://dialin.teams.microsoft.com/abc>',
+  'For organizers: Meeting options<https://teams.microsoft.com/meetingOptions/?organizerId=1>',
+  '________________________________________________________________',
+].join('\n')
+
+const teamsEvent = {
+  conference: { name: 'Microsoft Teams', entries: [
+    { kind: 'video', uri: 'https://teams.microsoft.com/l/meetup-join/19%3ameeting_ZjQ' },
+    { kind: 'more', uri: 'https://dialin.teams.microsoft.com/abc' },
+    { kind: 'phone', uri: 'tel:+15550100,,123456789#', label: '+1 555-0100' },
+  ]},
+  description: teamsBody,
+}
+eq(M.primaryMeeting(teamsEvent).uri, 'https://teams.microsoft.com/l/meetup-join/19%3ameeting_ZjQ',
+   'the join link, not the meeting-options link beside it')
+eq(M.primaryMeeting(teamsEvent).kind, 'video', 'and it is the video entry point')
+
+// the same event with nothing but the pasted block: the first recognised
+// link in a Teams body is still the join link
+eq(M.primaryMeeting({ description: teamsBody }).uri,
+   'https://teams.microsoft.com/l/meetup-join/19%3ameeting_ZjQ',
+   'scraped, the join link still leads')
+
+// Meet says its link twice and adds a tel.meet page; one row survives
+eq(M.primaryMeeting({
+  conference: { name: 'Google Meet', entries: [
+    { kind: 'video', uri: 'https://meet.google.com/abc-defg-hij' },
+    { kind: 'more', uri: 'https://tel.meet/abc-defg-hij?pin=1' },
+    { kind: 'phone', uri: 'tel:+15550100,,1#', pin: '1' },
+  ]},
+  description: 'Join at https://meet.google.com/abc-defg-hij',
+}).uri, 'https://meet.google.com/abc-defg-hij', 'Meet gives one row too')
+
+// a dial-in alone is still worth showing; there is nothing to click
+eq(M.primaryMeeting({ conference: { entries: [
+  { kind: 'phone', uri: 'tel:+15550100', label: '+1 555-0100' }]}}).kind, 'phone',
+  'with nothing clickable, the number is the answer')
+
+eq(M.primaryMeeting({}), null, 'no call, no row')
+eq(M.primaryMeeting({ description: 'lunch with https://wiki.example.com/x' }), null,
+   'and a wiki link is not a call')
 
 // how a row reads
 const [video, phone] = M.meetingLinks({ conference: { name: 'Zoom Meeting', entries: [

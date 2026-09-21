@@ -480,6 +480,25 @@ function meetingLinks(ev) {
   return clickable.concat(dial)
 }
 
+// The one way in the panel offers.
+//
+// An invitation's boilerplate is full of links. A Teams block alone carries
+// the join link, a dial-in lookup, a help page and the organiser's meeting
+// options, all on hosts this file recognises — and a box with six rows in
+// it is not an answer to "where do I click".
+//
+// The answer is the join link: the first video entry point the provider
+// declared, which is the one thing every provider fills in the same way.
+// What Google sent beats anything scraped out of prose, because
+// `meetingLinks` puts the entry points first, and a dial-in is only ever
+// offered when there is nothing to click at all.
+function primaryMeeting(ev) {
+  var all = meetingLinks(ev)
+  for (var i = 0; i < all.length; i++)
+    if (all[i].kind === "video" && all[i].openable) return all[i]
+  return all.length ? all[0] : null
+}
+
 // What a call row is headed with. The provider if one is known, and
 // otherwise the plainest true thing: the host you would be dialling into.
 function meetingName(m) {

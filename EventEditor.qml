@@ -29,9 +29,10 @@ Item {
     return c.writable && c.enabled
   })
 
-  // Every way into this event's call: what Google filled conferenceData
-  // with, plus any meeting link somebody pasted into the notes by hand.
-  readonly property var meetings: draft ? Model.meetingLinks(draft) : []
+  // The one way into this event's call. An invitation's boilerplate carries
+  // half a dozen links on hosts worth recognising; the join link is the one
+  // worth a box.
+  readonly property var meeting: draft ? Model.primaryMeeting(draft) : null
 
   // The notes open closed. A card that opens at the height of somebody's
   // invitation boilerplate is a card you scroll past to reach Save.
@@ -321,7 +322,7 @@ Item {
         Column {
           id: callBox
           width: parent.width
-          visible: root.meetings.length > 0
+          visible: root.meeting !== null
           spacing: Style.space(6)
 
           PanelSeparator { width: parent.width; foreground: root.panel.ink }
@@ -334,93 +335,89 @@ Item {
             font.letterSpacing: 1.4
           }
 
-          Repeater {
-            model: root.meetings
+          Rectangle {
+            width: parent.width
+            height: Math.max(Style.space(40), rowText.implicitHeight + Style.space(14))
+            radius: Style.cornerRadius > 0 ? Style.space(3) : 0
+            color: Util.alpha(root.panel.ink, 0.06)
+            border.width: 1
+            border.color: Util.alpha(root.panel.ink, 0.14)
 
-            Rectangle {
-              id: callRow
-              required property var modelData
+            Text {
+              id: rowGlyph
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(9)
+              anchors.verticalCenter: parent.verticalCenter
+              text: !root.meeting ? ""
+                  : root.meeting.kind === "phone" ? "󰏲"
+                  : root.meeting.kind === "video" ? "󰕧" : "󰌷"
+              color: Color.accent
+              font.family: root.panel.mono
+              font.pixelSize: Style.font.icon
+            }
 
-              width: callBox.width
-              height: Math.max(Style.space(40), rowText.implicitHeight + Style.space(14))
-              radius: Style.cornerRadius > 0 ? Style.space(3) : 0
-              color: Util.alpha(root.panel.ink, 0.06)
-              border.width: 1
-              border.color: Util.alpha(root.panel.ink, 0.14)
+            Column {
+              id: rowText
+              anchors.left: rowGlyph.right
+              anchors.leftMargin: Style.space(8)
+              anchors.right: rowAction.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: 0
 
               Text {
-                id: rowGlyph
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(9)
-                anchors.verticalCenter: parent.verticalCenter
-                text: callRow.modelData.kind === "phone" ? "󰏲"
-                    : callRow.modelData.kind === "video" ? "󰕧" : "󰌷"
-                color: Color.accent
+                width: parent.width
+                text: Model.meetingName(root.meeting)
+                textFormat: Text.PlainText
+                color: root.panel.ink
                 font.family: root.panel.mono
-                font.pixelSize: Style.font.icon
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
               }
 
-              Column {
-                id: rowText
-                anchors.left: rowGlyph.right
-                anchors.leftMargin: Style.space(8)
-                anchors.right: rowAction.left
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: 0
+              // Somebody else's URL, drawn as text and never as markup.
+              Text {
+                width: parent.width
+                text: Model.meetingDetail(root.meeting)
+                textFormat: Text.PlainText
+                color: root.panel.dim
+                font.family: root.panel.mono
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
 
-                Text {
-                  width: parent.width
-                  text: Model.meetingName(callRow.modelData)
-                  textFormat: Text.PlainText
-                  color: root.panel.ink
-                  font.family: root.panel.mono
-                  font.pixelSize: Style.font.bodySmall
-                  elide: Text.ElideRight
-                }
+            // A number cannot be joined, so it is offered as something to
+            // paste into whatever you dial with instead.
+            Button {
+              id: rowAction
+              property bool copied: false
+              readonly property bool joinable: root.meeting !== null && root.meeting.openable
 
-                // Somebody else's URL, drawn as text and never as markup.
-                Text {
-                  width: parent.width
-                  text: Model.meetingDetail(callRow.modelData)
-                  textFormat: Text.PlainText
-                  color: root.panel.dim
-                  font.family: root.panel.mono
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              text: joinable ? "JOIN" : (copied ? "COPIED" : "COPY")
+              tooltipText: root.meeting ? root.meeting.uri : ""
+              foreground: joinable ? Color.accent : root.panel.dim
+              accent: Color.accent
+              fontFamily: root.panel.mono
+              fontSize: Style.font.caption
+              bordered: true
+              onClicked: {
+                if (!root.meeting) return
+                if (joinable) root.openLink(root.meeting.uri)
+                else {
+                  Quickshell.clipboardText = Model.meetingCopyText(root.meeting)
+                  copied = true
+                  revert.restart()
                 }
               }
 
-              // A number cannot be joined, so it is offered as something to
-              // paste into whatever you dial with instead.
-              Button {
-                id: rowAction
-                property bool copied: false
-
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                text: callRow.modelData.openable ? "JOIN" : (copied ? "COPIED" : "COPY")
-                tooltipText: callRow.modelData.uri
-                foreground: callRow.modelData.openable ? Color.accent : root.panel.dim
-                accent: Color.accent
-                fontFamily: root.panel.mono
-                fontSize: Style.font.caption
-                bordered: true
-                onClicked: {
-                  if (callRow.modelData.openable) root.openLink(callRow.modelData.uri)
-                  else {
-                    Quickshell.clipboardText = Model.meetingCopyText(callRow.modelData)
-                    copied = true
-                    revert.restart()
-                  }
-                }
-
-                Timer {
-                  id: revert
-                  interval: 1400
-                  onTriggered: rowAction.copied = false
-                }
+              Timer {
+                id: revert
+                interval: 1400
+                onTriggered: rowAction.copied = false
               }
             }
           }

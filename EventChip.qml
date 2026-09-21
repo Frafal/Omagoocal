@@ -28,11 +28,11 @@ Rectangle {
 
   readonly property color tint: event ? event.color : panel.ink
 
-  // The calls attached to this event, evaluated once when the event changes
-  // and shared by the marker and the tooltip. A meeting you can join is
-  // worth knowing about without opening the event to find out.
-  readonly property var calls: (!overflow && event) ? Model.meetingLinks(event) : []
-  readonly property bool hasCall: calls.length > 0
+  // The call on this event, evaluated once when the event changes and
+  // shared by the marker and the tooltip. A meeting you can join is worth
+  // knowing about without opening the event to find out.
+  readonly property var call: (!overflow && event) ? Model.primaryMeeting(event) : null
+  readonly property bool hasCall: call !== null
 
   color: overflow
     ? (hover.containsMouse ? Util.alpha(Color.accent, 0.26) : Util.alpha(panel.ink, 0.13))
@@ -220,7 +220,7 @@ Rectangle {
           + "\n" + Model.rangeLabel(root.event, root.panel.hours12)
           + "\n" + root.event.calendarName
           + (root.event.location ? "\n󰍎 " + root.event.location : "")
-          + (root.hasCall ? "\n󰕧 " + Model.meetingName(root.calls[0]) : "")
+          + (root.hasCall ? "\n󰕧 " + Model.meetingName(root.call) : "")
     }
   }
 }
